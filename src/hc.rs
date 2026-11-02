@@ -42,6 +42,9 @@ pub struct EventLines {
     seen: HashMap<String, u64>,
     /// A fresh snapshot replaced the terminals since the last `take_seen`.
     resynced: bool,
+    /// `message_sent` events since the last `take_messages`, without any text
+    /// (only `seq`, `terminal`, `source`, `target`, `at`, `started`).
+    messages: Vec<Value>,
 }
 
 /// What a push changed.
@@ -62,6 +65,12 @@ impl EventLines {
     /// The `herdr.seen` values that went by, and whether a snapshot replaced everything.
     pub fn take_seen(&mut self) -> (HashMap<String, u64>, bool) {
         (std::mem::take(&mut self.seen), std::mem::take(&mut self.resynced))
+    }
+
+    /// The sends heard since the last call, oldest first. They are facts
+    /// about a send, not a change to any terminal.
+    pub fn take_messages(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.messages)
     }
 
     fn note_seen(&mut self, address: &Value, labels: &Value) {
@@ -106,6 +115,12 @@ impl EventLines {
                     self.seq = p["seq"].as_u64().unwrap_or(self.seq);
                     if p["type"] == "doc" {
                         pushed.docs = true;
+                    } else if p["type"] == "message_sent" {
+                        let d = &p["data"];
+                        self.messages.push(json!({
+                            "seq": p["seq"], "terminal": p["terminal"],
+                            "source": d["source"], "target": d["target"], "at": d["at"], "started": d["started"],
+                        }));
                     } else {
                         pushed.terminals |= self.apply(p);
                     }
@@ -498,6 +513,32 @@ mod tests {
         assert!(got.terminals && got.docs, "missed: everything again");
         assert_eq!(addresses(&lines), ["t9"]);
         assert!(lines.push(format!("{}\n", json!({"method": "event", "params": {"seq": 21, "type": "doc"}})).as_bytes()).docs);
+    }
+
+    #[test]
+    fn a_send_is_kept_apart_and_changes_no_terminal() {
+        let sent = |seq: u64, t: &str, data: Value| {
+            format!("{}\n", json!({"method": "event", "params": {"seq": seq, "type": "message_sent", "terminal": t, "data": data}}))
+        };
+        let rec = json!({"address": "rohan/t7", "state": "live", "title": "", "labels": {}, "status": {"state": "idle"}});
+        let mut lines = EventLines::new(&json!({"seq": 5, "terminals": [rec.clone()]}));
+        let before = lines.live();
+        let line = sent(6, "rohan/t7", json!({"source": "t3", "target": "rohan/t7", "at": 1700, "started": true, "text": "secret"}));
+        // A line split across frames still arrives once.
+        let (a, b) = line.split_at(20);
+        assert!(!lines.push(a.as_bytes()).terminals);
+        let got = lines.push(b.as_bytes());
+        assert!(!got.terminals && !got.docs, "a send is not a terminal change");
+        assert_eq!(lines.live(), before);
+        assert!(!lines.push(sent(6, "rohan/t7", json!({"source": "t3", "target": "rohan/t7", "at": 1700, "started": true})).as_bytes()).terminals);
+        assert!(!lines.push(sent(4, "rohan/t7", json!({"source": null, "target": "rohan/t7", "at": 1, "started": null})).as_bytes()).terminals);
+        lines.push(sent(7, "t9", json!({"source": null, "target": "t9", "at": 1800, "started": null})).as_bytes());
+        let taken = lines.take_messages();
+        assert_eq!(taken, [
+            json!({"seq": 6, "terminal": "rohan/t7", "source": "t3", "target": "rohan/t7", "at": 1700, "started": true}),
+            json!({"seq": 7, "terminal": "t9", "source": null, "target": "t9", "at": 1800, "started": null}),
+        ], "older and repeated seqs dropped; never the text");
+        assert!(lines.take_messages().is_empty());
     }
 
     #[test]
