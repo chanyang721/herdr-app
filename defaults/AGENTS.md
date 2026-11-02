@@ -902,7 +902,11 @@ All of it is in `herdr.d.ts`. In short:
   the first read even if it fails, and offline machines are unavailable),
   `agents()` (status, app, space, tab, pinned, focused; "done" turns "idle"
   once someone looks at it on any Herdr client), `terminals()`
-  (every core terminal), `focused()`, `layout()`, `theme()` (every color by
+  (every core terminal), `messageEvents()` (the last 1024 sends since the app
+  started, oldest first: id, seq, source ("external" when not a terminal),
+  target, at, started; never the text; machine-qualified addresses like
+  `rohan/t7`; a send is not a status change: `started` says whether the target
+  went working, the entry only that text was typed in), `focused()`, `layout()`, `theme()` (every color by
   name: background (the terminals', cards), canvas (behind cards), chrome
   (sidebars, bars), surface, popover, raised, hover, selected, border,
   input (a stronger border), foreground, muted, dim, accent,
