@@ -71,6 +71,12 @@ pub(super) struct Plan {
     stamp: Value,
 }
 
+/// Only an exact, complete batch receipt can produce the value accepted by `finish`.
+pub(super) struct Completed {
+    identities: Vec<Identity>,
+    stamp: Value,
+}
+
 impl Plan {
     pub fn capture(target: Target, model: &Model, live: &HashMap<String, Value>) -> Result<Self, String> {
         let remote = match &target {
@@ -126,9 +132,20 @@ impl Plan {
         Ok(())
     }
 
+    pub fn completed(&self, mut terminated: Vec<Identity>) -> Result<Completed, String> {
+        terminated.sort_by(|a,b| a.address.cmp(&b.address));
+        if terminated != self.expected {
+            return Err("close batch did not confirm exactly the prepared terminal identities".into());
+        }
+        Ok(Completed { identities: terminated, stamp: self.stamp.clone() })
+    }
+
     /// The only model mutation in the close protocol. Errors leave even layout/focus intact.
-    pub fn finish(&self, model: &mut Model, result: Result<(), String>) -> Result<(), String> {
-        result?;
+    pub fn finish(&self, model: &mut Model, result: Result<Completed, String>) -> Result<(), String> {
+        let completed = result?;
+        if completed.identities != self.expected || completed.stamp != self.stamp {
+            return Err("close receipt belongs to another plan".into());
+        }
         self.unchanged(model)?;
         match &self.target {
             Target::Space(id) => { model.remove_space(id); }
@@ -206,7 +223,7 @@ mod tests {
         let (mut model,live)=fixture();
         let plan=Plan::capture(Target::Space("s".into()),&model,&live).unwrap();
         model.add_tab("s",Tab::new("later","new work","new-pane","t4"));
-        assert!(plan.finish(&mut model,Ok(())).is_err());
+        assert!(plan.finish(&mut model,plan.completed(plan.expected.clone())).is_err());
         assert!(model.tab("tab").is_some());
         assert!(model.tab("later").is_some());
     }
@@ -216,8 +233,22 @@ mod tests {
         let (mut model,live)=fixture();
         model.add_tab("s",Tab::new("other","keep","other-pane","t4"));
         let plan=Plan::capture(Target::Tab("tab".into()),&model,&live).unwrap();
-        plan.finish(&mut model,Ok(())).unwrap();
+        plan.finish(&mut model,plan.completed(plan.expected.clone())).unwrap();
         assert!(model.tab("tab").is_none());
         assert!(model.tab("other").is_some());
+    }
+
+    #[test]
+    fn partial_duplicate_extra_and_stale_batch_receipts_never_change_the_layout() {
+        let (mut model,live)=fixture();
+        let plan=Plan::capture(Target::Space("s".into()),&model,&live).unwrap();
+        for ids in [plan.expected[..2].to_vec(), vec![plan.expected[0].clone();3],
+            [plan.expected.clone(),vec![Identity{address:"t9".into(),pid:9,created_ms:109}]].concat()] {
+            assert!(plan.finish(&mut model,plan.completed(ids)).is_err());
+            assert!(model.space("s").is_some());
+        }
+        let other=Plan::capture(Target::Tab("tab".into()),&model,&live).unwrap();
+        assert!(other.finish(&mut model,plan.completed(plan.expected.clone())).is_err());
+        assert!(model.tab("tab").is_some());
     }
 }
