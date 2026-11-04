@@ -94,7 +94,9 @@ If the container changed, cleanup removes only original pane/address pairs still
 present and preserves new or replaced content. Timeouts, partial receipts, live
 targets and unknown records retain the model, holds and operation evidence.
 Automatic pending requests hold local focus and selection, while typing/pasting
-into the already focused terminal remains available during preparation. Core
+into the already focused terminal remains available during preparation. Mouse
+interaction within the already focused pane/mod is also allowed; only clicks
+that could change focus and selection remain held. Core
 input generations invalidate stale approvals and the native READY/commit fence
 refuses input only at that boundary; helper report requests use this same rule.
 

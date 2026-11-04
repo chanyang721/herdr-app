@@ -2811,6 +2811,12 @@ impl AppWindow {
         }
     }
 
+    fn close_mouse_allowed(&self, at: Point<Pixels>) -> bool {
+        if !self.automatic_close_pending {return true}
+        let focus=self.focused_block.clone().or_else(||self.focused_pane.clone()).or_else(||self.model.focused_pane());
+        focus.as_ref().and_then(|id|self.bounds.borrow().get(id).copied()).is_some_and(|bounds|bounds.contains(&at))
+    }
+
     fn reload_close_evidence(&mut self) -> Result<(),String> {
         if self.pending_close.is_some() {return Err("wait for the pending close before reloading evidence".into())}
         let core_id=self.core.hello["core"]["id"].as_str().ok_or("missing core identity")?;
@@ -5062,7 +5068,7 @@ impl Render for AppWindow {
                 }
             }))
             .capture_any_mouse_down(cx.listener(|this, ev: &MouseDownEvent, _, cx| {
-                if this.automatic_close_pending { cx.stop_propagation(); return; }
+                if !this.close_mouse_allowed(ev.position) { cx.stop_propagation(); return; }
                 this.pointer=ev.position;
             }))
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
@@ -5525,6 +5531,11 @@ mod tests {
             let plan=close::Plan::capture(close::Target::Tab("tb2".into()),&this.model,&this.live).unwrap();
             this.pending_close=Some(plan);
             this.automatic_close_pending=true;
+            this.focused_pane=Some("p1".into());
+            this.bounds.borrow_mut().insert("p1".into(),gpui::Bounds::new(gpui::point(gpui::px(0.),gpui::px(0.)),gpui::size(gpui::px(100.),gpui::px(100.))));
+            assert!(this.close_mouse_allowed(gpui::point(gpui::px(50.),gpui::px(50.))));
+            assert!(!this.close_mouse_allowed(gpui::point(gpui::px(150.),gpui::px(50.))));
+
             let slot=this.documents.get_mut("").unwrap();
             slot.available=true;
             slot.document=Some(crate::mirror::Document::capture(&this.model,None));
@@ -5551,6 +5562,7 @@ mod tests {
             assert_eq!(this.close_deferred_documents.len(),1);
             // Manual close still holds structure, while allowing the person to focus.
             this.automatic_close_pending=false;
+            assert!(this.close_mouse_allowed(gpui::point(gpui::px(150.),gpui::px(50.))));
             let reply=this.run("pane.focus",json!({"pane":"p2"}),window,cx);
             assert!(reply.get("error").is_none(),"{reply}");
             assert_eq!(this.model.focused_pane().as_deref(),Some("p2"));
