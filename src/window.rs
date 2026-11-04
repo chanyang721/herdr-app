@@ -5554,7 +5554,7 @@ mod tests {
                 ("space.select",json!({"id":"s2"})),("tab.select",json!({"id":"tb2"})),
                 ("tab.move",json!({"id":"tb2","index":1})),("pane.swap",json!({"direction":"right"})),
             ] {
-                let reply=this.run(command,args,window,cx);
+                let reply=this.run_as(command,args,true,window,cx);
                 assert!(reply["error"].as_str().is_some_and(|e|e.contains("held")),"{command}: {reply}");
                 assert_eq!(snapshot(&this.model),before,"{command} changed the model before native outcome");
             }
@@ -5568,11 +5568,11 @@ mod tests {
             // Manual close still holds structure, while allowing the person to focus.
             this.automatic_close_pending=false;
             assert!(this.close_mouse_allowed(gpui::point(gpui::px(150.),gpui::px(50.))));
-            let reply=this.run("pane.focus",json!({"pane":"p2"}),window,cx);
+            let reply=this.run_as("pane.focus",json!({"pane":"p2"}),true,window,cx);
             assert!(reply.get("error").is_none(),"{reply}");
             assert_eq!(this.model.focused_pane().as_deref(),Some("p2"));
             let after_focus=snapshot(&this.model);
-            let reply=this.run("tab.move",json!({"id":"tb2","index":1}),window,cx);
+            let reply=this.run_as("tab.move",json!({"id":"tb2","index":1}),true,window,cx);
             assert!(reply["error"].as_str().is_some_and(|e|e.contains("held")));
             assert_eq!(snapshot(&this.model),after_focus);
             this.pending_close=None;
