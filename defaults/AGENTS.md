@@ -618,6 +618,7 @@ The main ones:
   (personal tree edits; on shipped layouts only click/look fields change),
   `layout.reset {name?}` (reset a shipped layout and its clicks),
   `layout.clone {name, as?}` (duplicate, then switch; default `<name>-copy`).
+- Recovery: `app.close_evidence_reload` (reload a repaired original operation file; never closes a session).
 - App: `mod.clone {name, as?}` (duplicate; default `<name>-copy`), `mod.open {name}` (again: closes it), `overlay.close {id?}`, `app.help` (again: closes it), `app.palette` (again: closes it), `app.settings {section?}`
   (sections: `look`, `machines`, `alerts`, `updates`, `privacy`; Machines lists, updates, renames and removes ssh machines; settings edit the same files you do).
   `app.check_updates` (only a successful check reports Up to date; a failed check clears the checked time and can be retried), `app.update_core` (a newer herdr-core of this generation, terminals kept;
@@ -1041,3 +1042,8 @@ terminal.kill_batch, terminal.close_reconcile, and terminal.close_snapshot.
 A core version alone does not establish compatibility. Install the app last after
 isolated validation and review. The automatic idle closer leaves the last session
 of the last workspace for a person to close manually.
+
+If retained close evidence is corrupt, the error names the exact file. Preserve
+it and restore that same operation file from a verified backup. Do not delete it
+or guess identities. Run app.close_evidence_reload after repair; this reload
+never closes a session or releases an uncertain hold by itself.

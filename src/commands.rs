@@ -84,6 +84,7 @@ pub const COMMANDS: &[Command] = &[
     cmd("mod.open", &[req("name")], "Toggle a mod as the overlay its mod.json describes; calling again closes it."),
     cmd("overlay.close", &[opt("id")], "Close an overlay (default: the top dialog or popup)."),
     // The app.
+    cmd("app.close_evidence_reload", &[], "Reload repaired close evidence without closing a session."),
     cmd("app.help", &[], "Toggle the keys dialog."),
     cmd("app.welcome", &[], "Show the welcome again."),
     cmd("app.whats_new", &[], "Show what this release brought (it opens once by itself after an update)."),

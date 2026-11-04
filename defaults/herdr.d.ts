@@ -80,6 +80,7 @@ export function playSound(sound: string): null;
 export function run(name: string, args?: Record<string, unknown>): null;
 
 /** Preserves automatic-close protections in the native guarded close transaction. */
+/** Reload a repaired operation file with do("app.close_evidence_reload"); it never closes a session. */
 /** Recover an uncertain close with do("terminal.close_reconcile", {operation_id}). */
 export interface CloseContext { mode: "automatic"; handoff: string; }
 

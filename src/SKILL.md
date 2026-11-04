@@ -156,3 +156,7 @@ Never experiment with pointer/key automation on the person's real display.
 When developing the app on Linux, its `scripts/sandbox` provides an isolated
 home, core and display: `up`, `do`, `status`, `shot`, then `down` when done.
 Never stop a server or session you didn't start.
+
+For corrupt close evidence, preserve the named file and restore the same operation
+from a verified backup, then run app.close_evidence_reload. Reload never closes
+a session or drops an in-memory uncertain scope.

@@ -474,7 +474,7 @@ impl AppWindow {
         let retained=close::load_pending(&file("close-pending"),core.hello["core"]["id"].as_str().unwrap_or_default());
         let close_evidence_error=retained.as_ref().err().cloned();
         let retained_closes=retained.unwrap_or_default();
-        let close_holds=retained_closes.values().flat_map(|p|p.expected.iter().map(|i|i.address.clone())).collect();
+        let close_holds=retained_closes.values().filter(|p|!p.ui_applied).flat_map(|p|p.expected.iter().map(|i|i.address.clone())).collect();
         let mut w = AppWindow {
             core,
             runtime,
@@ -2003,6 +2003,7 @@ impl AppWindow {
             self.model.spaces.retain(|s| s.machine.as_deref().is_none_or(|m| states.contains_key(m)));
             changed |= before != self.model.spaces.len();
         }
+        self.cleanup_close_evidence();
         if !listing || changed || shown(&self.documents) != was {
             self.publish(cx);
             cx.notify();
@@ -2759,9 +2760,14 @@ impl AppWindow {
         let finished=if recovering {plan.finish_reconciled(&mut self.model,result)}else{plan.finish(&mut self.model,result)};
         match finished {
             Ok(()) => {
-                // Keep durable evidence: a document write or process can fail after
-                // this callback. A later app can still reconcile the original op.
-                self.retained_closes.remove(&plan.operation_id);
+                // Persist proof state before retiring the file. Startup does not
+                // resurrect a completed hold; a failed layout write can still
+                // recover the original operation and exact scope.
+                let core_id=self.core.hello["core"]["id"].as_str().unwrap_or_default();
+                match close::mark_applied(&file("close-pending"),core_id,plan) {
+                    Ok(marked)=>{self.retained_closes.insert(marked.operation_id.clone(),marked);}
+                    Err(error)=>{self.layout_notice("Close evidence needs recovery",&error,window,cx);}
+                }
                 let blocks = self.chrome.terminals().iter().filter(|node| node.terminal().is_some_and(|address| plan.expected.iter().any(|identity| identity.address == address)))
                     .map(|node| node.id.clone()).collect::<Vec<_>>();
                 for block in blocks { self.chrome.remove(&block); }
@@ -2784,6 +2790,46 @@ impl AppWindow {
     }
 
 
+    /// A confirmed core layout document must no longer contain the terminal;
+    /// current UI absence alone never proves that restart recovery is unnecessary.
+    fn cleanup_close_evidence(&mut self) {
+        let Some(slot)=self.documents.get("") else {return};
+        if !slot.available {return}
+        let Some(document)=&slot.document else {return};
+        let mut persisted=Model::default();document.replace(&mut persisted,None);
+        let ready=self.retained_closes.values().filter(|plan|
+            self.pending_close.as_ref().is_none_or(|p|p.operation_id!=plan.operation_id)
+            && plan.cleanup_ready(&self.model,&persisted)
+            && !self.chrome.terminals().iter().chain(self.file_chrome.terminals().iter())
+                .any(|n|n.terminal().is_some_and(|a|plan.expected.iter().any(|i|i.address==a))))
+            .cloned().collect::<Vec<_>>();
+        for plan in ready {
+            match close::remove_pending(&file("close-pending"),&plan) {
+                Ok(())=>{self.retained_closes.remove(&plan.operation_id);}
+                Err(error)=>tracing::warn!("completed close evidence retained: {error}"),
+            }
+        }
+    }
+
+    fn reload_close_evidence(&mut self) -> Result<(),String> {
+        if self.pending_close.is_some() {return Err("wait for the pending close before reloading evidence".into())}
+        let core_id=self.core.hello["core"]["id"].as_str().ok_or("missing core identity")?;
+        let restored=close::load_pending(&file("close-pending"),core_id)?;
+        for (op,plan) in &restored {
+            if self.retained_closes.get(op).is_some_and(|old|!old.same_scope(plan)) {
+                return Err(format!("repaired file changes original operation scope: {op}"));
+            }
+        }
+        // Merge, never drop an in-memory uncertain scope just because its file
+        // disappeared. Reload is not permission to release a hold or prune UI.
+        for (op,plan) in restored {
+            if !plan.ui_applied {self.close_holds.extend(plan.expected.iter().map(|i|i.address.clone()));}
+            self.retained_closes.entry(op).or_insert(plan);
+        }
+        self.close_evidence_error=None;
+        self.cleanup_close_evidence();Ok(())
+    }
+
     /// An existing exit/missing-pane event requests a signal-free audit. It
     /// never restores blanket prune permission and never starts a new kill.
     fn begin_natural_audit(&mut self, target: close::Target, observation: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -2792,6 +2838,9 @@ impl AppWindow {
             Ok(plan)=>plan,
             Err(error)=>{ if !observation {self.fail(error);} return; }
         };
+        if let Some(plan)=self.retained_closes.values().find(|p|p.ui_applied && p.expected.iter().any(|i|draft.roots.contains(&i.address))).cloned() {
+            return self.begin_close_request(plan.target.clone(),Value::Null,Some(plan),window,cx);
+        }
         if draft.roots.iter().any(|a|self.close_holds.contains(a)) { if !observation {self.fail("reconcile the original held operation first");} return; }
         if observation && draft.roots.iter().any(|a|self.natural_audit_attempted.contains(a)
             || self.natural_snapshot_checked.get(a).is_some_and(|at|at.elapsed()<Duration::from_secs(30))) { return; }
@@ -3238,6 +3287,10 @@ impl AppWindow {
                         }
                     })
                     .detach();
+            }
+            "app.close_evidence_reload" => {
+                let result=self.reload_close_evidence().map(|_|json!({"ok":true}));
+                self.answer(result);
             }
             "terminal.close_reconcile" => {
                 let op=Self::arg(a,"operation_id").unwrap_or_default();

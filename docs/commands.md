@@ -445,6 +445,12 @@ Close an overlay (default: the top dialog or popup).
 |---|---|
 | `id` | no |
 
+## `app.close_evidence_reload`
+
+Reload repaired close evidence without closing a session.
+
+No arguments.
+
 ## `app.help`
 
 Toggle the keys dialog.

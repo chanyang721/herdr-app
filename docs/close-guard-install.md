@@ -34,3 +34,18 @@ Old or unbound natural exits remain visible until a valid pre-exit binding and
 actual Exit witness can be audited. Missing records alone never authorize
 cleanup. The app snapshot check cannot substitute for helper report, review,
 acceptance and learning verification.
+
+## Damaged local evidence
+
+The notice includes the full close-pending operation-file path. Preserve its
+bytes and diagnostic message. Restore that same operation from a verified backup
+or an independently verified original plan; do not guess roots/identities or
+delete the file to bypass the guard. Run app.close_evidence_reload after repair.
+The command validates all files and keeps any in-memory uncertain scope; it
+does not close a session, release an unknown hold or restart the app. If the
+original complete plan cannot be recovered, retain the pane and escalate the
+evidence to the core/helper reviewer instead of fabricating cleanup permission.
+
+Completed-operation files are retired after both current UI absence and a
+confirmed core layout document prove the terminated identities are no longer
+represented. A failed layout write retains the original recovery key.

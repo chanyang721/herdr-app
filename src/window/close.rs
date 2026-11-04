@@ -69,6 +69,8 @@ pub(super) struct Plan {
     pub operation_id: String,
     #[serde(default)]
     pub audit_only: bool,
+    #[serde(default)]
+    pub ui_applied: bool,
     pub target: Target,
     pub roots: Vec<String>,
     pub expected: Vec<Identity>,
@@ -164,7 +166,7 @@ impl Plan {
             let address=n.terminal()?;
             expected.iter().any(|i|i.address==address).then(||(n.id.clone(),address.to_owned()))
         }).collect();
-        Ok(Self { operation_id, audit_only:false, target, roots, expected, stamp, panes })
+        Ok(Self { operation_id, audit_only:false, ui_applied:false, target, roots, expected, stamp, panes })
     }
 
     /// Capture UI scope before a read-only query; never interpret an empty
@@ -187,7 +189,7 @@ impl Plan {
         }).collect();
         use std::hash::{BuildHasher,Hasher};
         let random=||std::collections::hash_map::RandomState::new().build_hasher().finish();
-        Ok(Self {operation_id:format!("appclose{:016x}{:016x}",random(),random()),audit_only:true,
+        Ok(Self {operation_id:format!("appclose{:016x}{:016x}",random(),random()),audit_only:true,ui_applied:false,
             target,roots,expected:vec![],stamp,panes})
     }
 
@@ -273,7 +275,17 @@ impl Plan {
 
     pub fn represented(&self, model: &Model) -> bool {
         self.panes.iter().any(|(pane,address)|model.address_of(pane).as_deref()==Some(address.as_str()))
-            || matches!(&self.target,Target::Terminal(_))
+
+    }
+
+    pub fn same_scope(&self, other: &Self) -> bool {
+        self.operation_id==other.operation_id && self.target==other.target && self.roots==other.roots
+            && self.expected==other.expected && self.stamp==other.stamp && self.panes==other.panes
+            && self.audit_only==other.audit_only
+    }
+
+    pub fn cleanup_ready(&self, current: &Model, persisted: &Model) -> bool {
+        self.ui_applied && self.expected.iter().all(|i|current.pane_of(&i.address).is_none() && persisted.pane_of(&i.address).is_none())
     }
 
     /// A recovered receipt may clear only the originally captured panes when a
@@ -318,14 +330,36 @@ fn valid_operation(id: &str) -> bool {
     id.strip_prefix("appclose").is_some_and(|s| s.len() == 32 && s.bytes().all(|c| c.is_ascii_hexdigit()))
 }
 
-pub(super) fn save_pending(dir: &std::path::Path, core_id: &str, plan: &Plan) -> Result<(), String> {
+fn write_evidence(path: &std::path::Path, text: &[u8]) -> Result<(),String> {
     use std::io::Write;
+    use std::hash::{BuildHasher,Hasher};
+    let nonce=std::collections::hash_map::RandomState::new().build_hasher().finish();
+    let temporary=path.with_extension(format!("tmp.{}.{nonce:x}",std::process::id()));
+    let result=(|| {
+        let mut file=std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+        file.write_all(text)?;file.sync_all()?;drop(file);
+        std::fs::rename(&temporary,path)
+    })();
+    if result.is_err() {let _=std::fs::remove_file(&temporary);}
+    result.map_err(|e:std::io::Error|format!("{}: {e}",path.display()))
+}
+
+pub(super) fn save_pending(dir: &std::path::Path, core_id: &str, plan: &Plan) -> Result<(), String> {
     if core_id.is_empty() || !valid_operation(&plan.operation_id) || plan.expected.is_empty() || plan.roots.is_empty() { return Err("missing close core/operation identity or prepared scope".into()); }
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let path=dir.join(format!("{}.json",plan.operation_id));
+    if path.try_exists().map_err(|e|e.to_string())? {return Err("close operation evidence already exists".into());}
     let text=serde_json::to_vec(&Saved {core_id:core_id.into(),plan:plan.clone()}).map_err(|e|e.to_string())?;
-    let mut file=std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e|e.to_string())?;
-    file.write_all(&text).and_then(|_| file.sync_all()).map_err(|e| e.to_string())
+    write_evidence(&path,&text)
+
+}
+
+pub(super) fn mark_applied(dir: &std::path::Path, core_id: &str, plan: &Plan) -> Result<Plan,String> {
+    let mut marked=plan.clone();marked.ui_applied=true;
+    let path=dir.join(format!("{}.json",plan.operation_id));
+    let text=serde_json::to_vec(&Saved{core_id:core_id.into(),plan:marked.clone()}).map_err(|e|e.to_string())?;
+    write_evidence(&path,&text)?;
+    Ok(marked)
 }
 
 pub(super) fn load_pending(dir: &std::path::Path, core_id: &str) -> Result<BTreeMap<String,Plan>, String> {
@@ -338,10 +372,10 @@ pub(super) fn load_pending(dir: &std::path::Path, core_id: &str) -> Result<BTree
     for entry in files {
         let path=entry.map_err(|e|e.to_string())?.path();
         if path.extension().and_then(|s|s.to_str()) != Some("json") { continue; }
-        let saved:Saved=serde_json::from_slice(&std::fs::read(&path).map_err(|e|e.to_string())?).map_err(|e|format!("invalid retained close evidence: {e}"))?;
+        let saved:Saved=serde_json::from_slice(&std::fs::read(&path).map_err(|e|format!("cannot read {}: {e}",path.display()))?).map_err(|e|format!("invalid retained close evidence {}: {e}; restore this same file from a verified backup, then run app.close_evidence_reload; do not delete or guess its identities",path.display()))?;
         if saved.plan.expected.is_empty() || saved.plan.roots.is_empty() { return Err(format!("unprepared retained close evidence: {}",path.display())); }
         if !valid_operation(&saved.plan.operation_id) || path.file_stem().and_then(|s|s.to_str())!=Some(&saved.plan.operation_id) {
-            return Err("retained close operation identity mismatch".into());
+            return Err(format!("retained close operation identity mismatch: {}; restore a verified original file and run app.close_evidence_reload",path.display()));
         }
         if saved.core_id==core_id { plans.insert(saved.plan.operation_id.clone(),saved.plan); }
     }
@@ -683,6 +717,37 @@ mod tests {
     }
 
     #[test]
+    fn successful_evidence_is_retired_only_after_the_layout_document_confirms_absence() {
+        let (mut current,live)=fixture();
+        let plan=Plan::capture(Target::Terminal("t1".into()),&current,&live).unwrap();
+        let dir=std::env::temp_dir().join(&plan.operation_id);
+        save_pending(&dir,"core-a",&plan).unwrap();
+        current.remove_pane("p");
+        assert!(!plan.represented(&current),"a dead Terminal target is not permanently represented");
+        let marked=mark_applied(&dir,"core-a",&plan).unwrap();
+        let restored=load_pending(&dir,"core-a").unwrap().remove(&plan.operation_id).unwrap();
+        assert!(restored.ui_applied);
+        let (persisted,_)=fixture();
+        assert!(!marked.cleanup_ready(&current,&persisted),"pending layout write keeps recovery evidence");
+        let empty=Model::default();
+        assert!(marked.cleanup_ready(&current,&empty));
+        assert!(!plan.cleanup_ready(&current,&empty),"uncertain operations are never garbage-collected");
+        remove_pending(&dir,&marked).unwrap();std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn repaired_evidence_cannot_replace_an_existing_operation_scope() {
+        let (model,live)=fixture();
+        let plan=Plan::capture(Target::Pane("p".into()),&model,&live).unwrap();
+        let mut repaired=plan.clone();repaired.ui_applied=true;
+        assert!(plan.same_scope(&repaired));
+        repaired.expected[0].pid+=1;
+        assert!(!plan.same_scope(&repaired));
+        let mut moved=plan.clone();moved.target=Target::Space("s".into());
+        assert!(!plan.same_scope(&moved));
+    }
+
+    #[test]
     fn invalid_retained_evidence_is_not_silently_discarded() {
         let (model,live)=fixture();
         let plan=Plan::capture(Target::Pane("p".into()),&model,&live).unwrap();
@@ -693,7 +758,11 @@ mod tests {
         let text=std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("handoff"));
         std::fs::write(&path,"{unfinished").unwrap();
-        assert!(load_pending(&dir,"core-a").is_err());
+        let error=load_pending(&dir,"core-a").unwrap_err();
+        assert!(error.contains(path.to_string_lossy().as_ref()));
+        assert!(error.contains("app.close_evidence_reload"));
+        std::fs::write(&path,text).unwrap();
+        assert_eq!(load_pending(&dir,"core-a").unwrap().len(),1);
         std::fs::remove_file(path).unwrap();std::fs::remove_dir(dir).unwrap();
     }
 

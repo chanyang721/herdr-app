@@ -72,9 +72,17 @@ shutdown are core-side enforcement responsibilities.
 
 Before any batch RPC, the app durably writes the immutable plan, caller operation
 ID, core ID and original pane/address pairs to `close-pending/<operation>.json`.
-No automatic handoff capability is stored. Invalid evidence blocks new closes
-rather than being silently discarded. Evidence is retained even after successful
-UI cleanup so a failed layout write or app crash cannot lose the recovery key.
+No automatic handoff capability is stored. Atomic evidence writes sync before
+rename. Invalid evidence blocks new closes and names the exact path; restore that
+same file from a verified backup and use app.close_evidence_reload. Reload never
+closes a session or drops an in-memory uncertain scope. Never delete a damaged
+file or invent missing identities to clear the error.
+
+After exact success, the file is atomically marked UI-applied. Startup does not
+recreate a completed hold. The original operation remains recoverable until a
+confirmed core layout document and current model/chrome no longer represent its
+terminals, then the pending file is deleted. If layout persistence failed, the
+original operation is reconciled again, without a new kill.
 
 The app command `terminal.close_reconcile {operation_id}` also recovers an
 operation whose original container moved or vanished. Closing the same original
