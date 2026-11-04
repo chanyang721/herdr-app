@@ -80,7 +80,7 @@ export function playSound(sound: string): null;
 export function run(name: string, args?: Record<string, unknown>): null;
 
 /** Preserves automatic-close protections in the native guarded close transaction. */
-export interface CloseContext { mode: "automatic"; }
+export interface CloseContext { mode: "automatic"; handoff: string; }
 
 export type Status = "working" | "blocked" | "done" | "idle";
 

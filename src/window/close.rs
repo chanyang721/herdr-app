@@ -296,14 +296,14 @@ mod tests {
     fn rpc_preserves_automatic_context_and_commits_only_an_exact_success() {
         let (mut model,live)=fixture();
         let plan=Plan::capture(Target::Space("s".into()),&model,&live).unwrap();
-        let result=plan.execute(&json!({"mode":"automatic"}),|params| {
-            assert_eq!(params["context"],json!({"mode":"automatic"}));
+        let result=plan.execute(&json!({"mode":"automatic","handoff":"one-use-test-capability"}),|params| {
+            assert_eq!(params["context"],json!({"mode":"automatic","handoff":"one-use-test-capability"}));
             assert_eq!(params["roots"],json!(["t1"]));
             Ok(json!({"ok":true,"terminated":plan.expected}))
         });
         plan.finish(&mut model,result).unwrap();
         assert!(model.space("s").is_none());
-        for context in [json!({}),json!({"mode":"manual"}),json!({"mode":"automatic","force":true})] {
+        for context in [json!({"mode":"automatic"}),json!({"mode":"automatic","handoff":""}),json!({}),json!({"mode":"manual"}),json!({"mode":"automatic","force":true})] {
             assert!(plan.execute(&context,|_|panic!("invalid context reached the core")).is_err());
         }
     }
@@ -338,9 +338,7 @@ mod tests {
 }
 
 pub(super) fn validate_context(context: &Value) -> Result<(), String> {
-    if context.is_null() { return Ok(()); }
-    if context.as_object().is_some_and(|v| v.len() == 1 && v.get("mode").and_then(Value::as_str) == Some("automatic")) { return Ok(()); }
-    Err("close_context must be {mode: automatic} or omitted".into())
+    crate::commands::validate_close_context(context)
 }
 
 pub(super) fn structural_command(name: &str) -> bool {

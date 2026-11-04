@@ -123,6 +123,15 @@ pub fn shorthand(c: &Command, value: &str) -> Value {
 
 /// Reject misspelled arguments before a command can use its current-target default.
 /// Null is the argument-free form used by keys and mods.
+/// The capability is opaque to the app and is passed unchanged to the helper.
+pub(crate) fn validate_close_context(context: &Value) -> Result<(), String> {
+    if context.is_null() { return Ok(()); }
+    if context.as_object().is_some_and(|v| v.len() == 2
+        && v.get("mode").and_then(Value::as_str) == Some("automatic")
+        && v.get("handoff").and_then(Value::as_str).is_some_and(|s| !s.is_empty() && s.len() <= 4096)) { return Ok(()); }
+    Err("close_context must contain automatic mode and an opaque handoff, or be omitted".into())
+}
+
 pub fn validate_args(c: &Command, args: &Value) -> Result<(), String> {
     let valid = if c.args.is_empty() { "none".into() } else { c.args.iter().map(|a| a.name).collect::<Vec<_>>().join(", ") };
     match args {
@@ -133,9 +142,7 @@ pub fn validate_args(c: &Command, args: &Value) -> Result<(), String> {
                 return Err(format!("{}: unknown argument(s): {}; valid arguments: {valid}", c.name, unknown.join(", ")));
             }
             for (key, value) in args {
-                if key == "close_context" && !value.is_null()
-                    && !value.as_object().is_some_and(|v| v.len() == 1 && v.get("mode").and_then(Value::as_str) == Some("automatic"))
-                { return Err(format!("{}: close_context must be {{mode: automatic}} or omitted", c.name)); }
+                if key == "close_context" { validate_close_context(value)?; }
                 if matches!(key.as_str(), "id" | "pane" | "space" | "terminal") && !value.is_string() && !value.is_null() {
                     return Err(format!("{}: argument {key} must be a string (or null to omit it)", c.name));
                 }
@@ -190,7 +197,7 @@ mod tests {
             assert!(validate_args(c, &Value::Null).is_ok());
             assert!(validate_args(c, &json!({})).is_ok());
             assert!(validate_args(c, &json!(["target"])).is_err());
-            let args: serde_json::Map<String, Value> = c.args.iter().map(|a| (a.name.into(), if a.name == "close_context" {json!({"mode":"automatic"})} else {json!("target")})).collect();
+            let args: serde_json::Map<String, Value> = c.args.iter().map(|a| (a.name.into(), if a.name == "close_context" {json!({"mode":"automatic","handoff":"one-use-test-capability"})} else {json!("target")})).collect();
             assert!(validate_args(c, &Value::Object(args)).is_ok());
         }
         let close = find("space.close").unwrap();
@@ -232,8 +239,8 @@ mod tests {
     #[test]
     fn automatic_close_context_is_explicit_and_cannot_be_malformed() {
         let c = find("pane.close").unwrap();
-        assert!(validate_args(c, &json!({"pane":"p", "close_context":{"mode":"automatic"}})).is_ok());
-        for value in [json!(true),json!("automatic"),json!({}),json!({"mode":"manual"}),json!({"mode":"automatic","force":true})] {
+        assert!(validate_args(c, &json!({"pane":"p", "close_context":{"mode":"automatic","handoff":"one-use-test-capability"}})).is_ok());
+        for value in [json!({"mode":"automatic"}),json!({"mode":"automatic","handoff":""}),json!({"mode":"automatic","handoff":5}),json!({"mode":"automatic","handoff":"x","force":true}),json!(true),json!("automatic"),json!({}),json!({"mode":"manual"}),json!({"mode":"automatic","force":true})] {
             assert!(validate_args(c,&json!({"pane":"p","close_context":value})).is_err());
         }
     }

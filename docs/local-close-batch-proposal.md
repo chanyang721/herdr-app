@@ -9,7 +9,7 @@ The native base is app v0.1.13 (93b097f).
 The app sends one `terminal.kill_batch` request:
 
 ```json
-{"roots":["t7"],"expected":[{"address":"t7","pid":700,"created_ms":100007}],"context":{"mode":"automatic"}}
+{"roots":["t7"],"expected":[{"address":"t7","pid":700,"created_ms":100007}],"context":{"mode":"automatic","handoff":"<one-use local capability>"}}
 ```
 
 `expected` is the exact set of selected roots and their unkept descendants.
@@ -29,8 +29,9 @@ and pane drags are held while a close is pending. Commands initially return
 
 ## Automatic context
 
-`pane.close` accepts optional `close_context:{mode:"automatic"}` and passes that
-object as RPC `context`. Unknown context fields/modes are refused. Internal
+`pane.close` accepts optional `close_context:{mode:"automatic",handoff:string}` and passes that
+object unchanged as RPC `context`. The handoff is a one-use local capability
+consumed by the helper; it is never interpreted by the app or recorded in history. Unknown context fields/modes are refused. Internal
 pane-to-tab-to-space escalation retains context and never silently becomes a
 manual close. Automatic escalation cannot bypass last-space confirmation.
 The helper preserves automatic timing, focus, pinning, last-pane and auto_close
@@ -51,7 +52,8 @@ recorded in its `docs/close-guard-v1.md` (implementation b077547).
   a random token and exact identities. It retains the lock.
 - Core rechecks the complete closure, identities, input generations and pending
   input/spawn work before the first signal, then fences new work on the batch.
-- Core sends committed only after every target is observed ended, or cancelled.
+- Core sends committed only after every target is observed ended, or cancelled
+  only before any termination signal. Partial signaling uses unclear/EOF.
   Both include the matching operation_id and token.
 - Helper independently verifies completion and sends closed/allow:false plus
   the same operation_id, then exits 0. Only closed plus exit 0 is a final ACK.
