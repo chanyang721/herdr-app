@@ -530,7 +530,9 @@ An uncertain result keeps its original operation evidence. Retry the same target
 to reconcile that operation without sending another kill, or use
 `terminal.close_reconcile {operation_id}` if its original container moved or
 vanished; only an exact audited
-receipt removes the original panes. Unbound natural exits remain visible.
+receipt removes the original panes. Unbound natural exits remain visible. A native `close_retry_safe` denial certifies
+no signal was sent: the layout stays intact and a later close uses a new operation.
+Timeouts and unknown results require original-operation reconciliation.
 Unverified natural exits and removed core records keep their panes. App quit
 and window close keep sessions; shutdown hooks cannot bypass the batch gate.
 

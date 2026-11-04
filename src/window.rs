@@ -2706,7 +2706,10 @@ impl AppWindow {
                 if recovering {
                     work.reconcile(|params|core.call_timeout("terminal.close_reconcile",params,Duration::from_secs(300)).map_err(|error|format!("{error:#}")))
                 } else {
-                    work.execute(&context, |params| core.call_timeout("terminal.kill_batch", params, Duration::from_secs(300)).map_err(|error| format!("{error:#}"))).map(close::Resolution::Closed)
+                    work.execute_guarded(&context, |params| core.call_timeout("terminal.kill_batch", params, Duration::from_secs(300))
+                        .map_err(|error| close::CallFailure {
+                            kind:crate::hc::error_kind(&error).map(str::to_owned), message:format!("{error:#}"),
+                        }))
                 }
             }).await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -4926,7 +4929,6 @@ impl Render for AppWindow {
                 }
             }))
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
-                if this.automatic_close_pending { cx.stop_propagation(); return; }
                 if ev.keystroke.key == "escape" && this.pane_drag.is_some() {
                     this.cancel_pane_drag(cx);
                     cx.stop_propagation();

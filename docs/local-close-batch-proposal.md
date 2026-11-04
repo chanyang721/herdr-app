@@ -82,12 +82,21 @@ verify the original journal, actual Exit witnesses and completed audit again.
 If the container changed, cleanup removes only original pane/address pairs still
 present and preserves new or replaced content. Timeouts, partial receipts, live
 targets and unknown records retain the model, holds and operation evidence.
-Automatic pending requests also hold local keyboard/mouse focus and selection.
+Automatic pending requests hold local focus and selection, while typing/pasting
+into the already focused terminal remains available during preparation. Core
+input generations invalidate stale approvals and the native READY/commit fence
+refuses input only at that boundary; helper report requests use this same rule.
 
 Natural exits without an original guarded operation are not yet a recoverable
 close. Native immutable identity/input-generation/session bindings and actual
 Exit witnesses are required for a separate audit operation; old unbound or
-not_found records remain denied. For definite pre-signal denial, only an exact operation/identity-bound response
+not_found records remain denied. A definite denial before READY carries native RPC `error.data.kind=close_retry_safe`.
+The app reads that structured kind from the response to its original batch call
+and retires its pending plan without any reconciliation attempt or UI cleanup.
+The helper can send a missing-report request during preparation: native input
+is fenced only from READY/commit, and earlier input changes invalidate approval.
+Unknown/EOF/timeout/post-signal errors are never inferred safe from message text.
+For recovery of an acknowledged pre-signal cancellation, only an exact operation/identity-bound response
 with `ok:false,state:"cancelled",no_signal:true,expected:[exact original]` retires
 the pending evidence and releases holds. It preserves the entire model and
 requires a new close request. An arbitrary error or timeout never releases holds.

@@ -82,6 +82,10 @@ pub(super) struct Completed {
 
 pub(super) enum Resolution { Closed(Completed), Cancelled }
 
+/// Only the native RPC error kind carries the no-signal guarantee. Display
+/// messages, timeout text and generic IO errors are never classified as safe.
+pub(super) struct CallFailure { pub kind: Option<String>, pub message: String }
+
 impl Plan {
     /// Transport is supplied by the caller; unit tests never reach a real core.
     pub fn execute(&self, context: &Value, call: impl FnOnce(Value) -> Result<Value, String>) -> Result<Completed, String> {
@@ -90,6 +94,17 @@ impl Plan {
         let mut params = json!({"operation_id": self.operation_id, "roots": self.roots, "expected": self.expected});
         if !context.is_null() { params["context"] = context.clone(); }
         self.accept_reply(call(params)?)
+    }
+
+    pub fn execute_guarded(&self, context: &Value, call: impl FnOnce(Value) -> Result<Value,CallFailure>) -> Result<Resolution,String> {
+        let mut failure=None;
+        let result=self.execute(context,|params|call(params).map_err(|error| {
+            let message=error.message.clone();failure=Some(error);message
+        }));
+        if failure.as_ref().and_then(|e|e.kind.as_deref())==Some("close_retry_safe") {
+            return Ok(Resolution::Cancelled);
+        }
+        result.map(Resolution::Closed)
     }
 
     /// Recovery never resends a kill; only the original operation can be reconciled.
@@ -479,6 +494,40 @@ mod tests {
     }
 
     #[test]
+    fn pre_ready_report_denial_allows_a_new_operation_without_reconcile_or_ui_cleanup() {
+        let (mut model,live)=fixture();
+        let plan=Plan::capture(Target::Space("s".into()),&model,&live).unwrap();
+        let dir=std::env::temp_dir().join(&plan.operation_id);
+        save_pending(&dir,"core-a",&plan).unwrap();
+        let result=plan.execute_guarded(&Value::Null,|params| {
+            assert_eq!(params["operation_id"],plan.operation_id);
+            Err(CallFailure {kind:Some("close_retry_safe".into()),message:"report requested before READY".into()})
+        });
+        assert!(matches!(result,Ok(Resolution::Cancelled)));
+        assert!(model.space("s").is_some());
+        remove_pending(&dir,&plan).unwrap();
+        assert!(load_pending(&dir,"core-a").unwrap().is_empty());
+        let next=Plan::capture(Target::Space("s".into()),&model,&live).unwrap();
+        assert_ne!(next.operation_id,plan.operation_id);
+        next.finish(&mut model,next.completed(next.expected.clone())).unwrap();
+        assert!(model.space("s").is_none());
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn unknown_or_post_signal_errors_cannot_become_retry_safe_by_message_text() {
+        let (model,live)=fixture();
+        let plan=Plan::capture(Target::Pane("p".into()),&model,&live).unwrap();
+        for kind in [None,Some("close_denied"),Some("timeout"),Some("cancelled"),Some("method_not_found")] {
+            let result=plan.execute_guarded(&Value::Null,|_|Err(CallFailure {
+                kind:kind.map(str::to_owned),message:"close_retry_safe no signal".into()
+            }));
+            assert!(result.is_err());
+            assert!(model.tab("tab").is_some());
+        }
+    }
+
+    #[test]
     fn old_cores_are_refused_before_creating_an_unrecoverable_operation() {
         for hello in [json!({}),json!({"methods":["terminal.kill"]}),json!({"methods":["terminal.kill_batch"]})] {
             assert!(!supported(&hello));
@@ -517,6 +566,8 @@ mod tests {
         assert!(full.contains("close::save_pending("));
         assert!(full.contains("close::load_pending("));
         for name in ["space.select","tab.next","pane.focus","agent.focus","layout.select","terminal.show"] { assert!(selection_command(name)); }
+        assert!(!selection_command("terminal.paste"));
+        assert!(!selection_command("terminal.paste_image"));
         assert!(!selection_command("app.quit"));
         assert!(!selection_command("window.close"));
         let mods=include_str!("../mods.rs");
@@ -552,7 +603,7 @@ pub(super) fn may_prune(completed: bool, held: bool) -> bool { completed && !hel
 
 pub(super) fn selection_command(name: &str) -> bool {
     name.starts_with("space.") || name.starts_with("tab.") || name.starts_with("pane.") || name.starts_with("agent.") || name.starts_with("layout.")
-        || matches!(name,"terminal.show"|"terminal.peek"|"terminal.search"|"terminal.paste"|"terminal.paste_image"|"mod.open"|"overlay.close"|"app.palette"|"app.settings"|"app.help")
+        || matches!(name,"terminal.show"|"terminal.peek"|"terminal.search"|"mod.open"|"overlay.close"|"app.palette"|"app.settings"|"app.help")
 }
 
 pub(super) fn supported(hello: &Value) -> bool {
