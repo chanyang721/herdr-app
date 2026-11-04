@@ -5376,6 +5376,66 @@ mod tests {
     }
 
     #[test]
+    fn automatic_close_keeps_selection_until_native_outcome() {
+        in_own_process("close_selection_gate");
+    }
+
+    #[gpui::test]
+    fn close_selection_gate(cx: &mut gpui::TestAppContext) {
+        use serde_json::json;
+        use super::close;
+        if !running_alone("close_selection_gate") { return; }
+        let (view,cx)=open_window(cx,"unused","",json!({
+            "id":"main","type":"block","content":{"tab":"active"}
+        }));
+        cx.update(|window,cx|view.update(cx,|this,cx| {
+            this.model.add_space("s1","one","",crate::model::Tab::new("tb1","","p1","t1"));
+            this.model.add_tab("s1",crate::model::Tab::new("tb2","","p2","t2"));
+            this.model.add_space("s2","two","",crate::model::Tab::new("tb3","","p3","t3"));
+            this.model.focus_pane("p1");
+            this.live=[("t1",1),("t2",2),("t3",3)].into_iter().map(|(address,pid)|
+                (address.into(),json!({"address":address,"pid":pid,"created_ms":100+pid,"labels":{}}))).collect();
+            let plan=close::Plan::capture(close::Target::Tab("tb2".into()),&this.model,&this.live).unwrap();
+            this.pending_close=Some(plan);
+            this.automatic_close_pending=true;
+            let slot=this.documents.get_mut("").unwrap();
+            slot.available=true;
+            slot.document=Some(crate::mirror::Document::capture(&this.model,None));
+            let snapshot=|m:&crate::model::Model|json!({
+                "document":crate::mirror::Document::capture(m,None),
+                "view":crate::mirror::View::capture(m)
+            });
+            let before=snapshot(&this.model);
+            for (command,args) in [
+                ("pane.focus",json!({"pane":"p2"})),("agent.focus",json!({"terminal":"t2"})),
+                ("space.select",json!({"id":"s2"})),("tab.select",json!({"id":"tb2"})),
+                ("tab.move",json!({"id":"tb2","index":1})),("pane.swap",json!({"direction":"right"})),
+            ] {
+                let reply=this.run(command,args,window,cx);
+                assert!(reply["error"].as_str().is_some_and(|e|e.contains("held")),"{command}: {reply}");
+                assert_eq!(snapshot(&this.model),before,"{command} changed the model before native outcome");
+            }
+            this.focus_agent("t2");
+            this.focus_block("p2",window,cx);
+            this.go("right",window,cx);
+            assert_eq!(snapshot(&this.model),before,"internal focus path bypassed automatic hold");
+            assert!(!this.documents_updated(None,vec![(String::new(),crate::mirror_sync::Outcome::Read(crate::mirror::Document::default(),99))],window,cx));
+            assert_eq!(snapshot(&this.model),before,"a mirrored update changed selection before outcome");
+            assert_eq!(this.close_deferred_documents.len(),1);
+            // Manual close still holds structure, while allowing the person to focus.
+            this.automatic_close_pending=false;
+            let reply=this.run("pane.focus",json!({"pane":"p2"}),window,cx);
+            assert!(reply.get("error").is_none(),"{reply}");
+            assert_eq!(this.model.focused_pane().as_deref(),Some("p2"));
+            let after_focus=snapshot(&this.model);
+            let reply=this.run("tab.move",json!({"id":"tb2","index":1}),window,cx);
+            assert!(reply["error"].as_str().is_some_and(|e|e.contains("held")));
+            assert_eq!(snapshot(&this.model),after_focus);
+            this.pending_close=None;
+        }));
+    }
+
+    #[test]
     fn pane_ring_follows_keyboard_focus() {
         in_own_process("pane_ring_focus");
     }

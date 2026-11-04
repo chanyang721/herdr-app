@@ -528,6 +528,18 @@ mod tests {
     }
 
     #[test]
+    fn automatic_selection_policy_does_not_turn_manual_focus_into_a_structural_edit() {
+        for name in ["pane.focus","pane.go","space.select","tab.select","agent.focus","terminal.show","layout.select"] {
+            assert!(selection_command(name));
+            assert!(!structural_command(name),"manual pending focus must remain available: {name}");
+        }
+        for name in ["tab.move","space.move","pane.swap","pane.close","terminal.park"] { assert!(structural_command(name)); }
+        for name in ["terminal.paste","terminal.paste_image","app.quit","window.close"] {
+            assert!(!selection_command(name));
+        }
+    }
+
+    #[test]
     fn old_cores_are_refused_before_creating_an_unrecoverable_operation() {
         for hello in [json!({}),json!({"methods":["terminal.kill"]}),json!({"methods":["terminal.kill_batch"]})] {
             assert!(!supported(&hello));
