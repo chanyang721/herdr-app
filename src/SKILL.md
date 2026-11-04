@@ -137,7 +137,7 @@ This local fork keeps space/tab/pane close and terminal.kill pending until the
 core's guarded batch returns an exact completion receipt. Refusal, unknown
 identity, unsupported core or remote target leaves the model in place. There is
 no single-terminal fallback. `pane.close` accepts `close_context: {mode:
-"automatic"}` for lifecycle automation; the core passes it to the policy helper
+"automatic", handoff: "<one-use capability>"}` for lifecycle automation; the core passes it to the policy helper
 so automatic timing/focus/last-pane protections remain in force. Omission is an
 explicit/manual close. Unverified exit/rm events retain their session panes.
 Window close and app quit remain available and preserve sessions; terminal.kill

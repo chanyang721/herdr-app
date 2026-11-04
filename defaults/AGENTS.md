@@ -525,7 +525,7 @@ one guarded core batch before changing the model. They can report `pending:
 true`; a later refusal is shown in the window and keeps its session layout.
 Unsupported cores, unverifiable identities and remote targets fail closed.
 There is no fallback to individual kills. `pane.close` automation must pass
-`close_context: {mode: "automatic"}` to retain automatic-close protections.
+`close_context: {mode: "automatic", handoff: "<one-use capability>"}` to retain automatic-close protections.
 Unverified natural exits and removed core records keep their panes. App quit
 and window close keep sessions; shutdown hooks cannot bypass the batch gate.
 
@@ -560,7 +560,7 @@ The main ones:
   `tab.settle {id?}`, `tab.unsettle {id?}` (index, next and prev
   skip settled tabs).
 - Panes: `pane.split {direction: "right" | "down", pane?, argv? | mod?, props?}` (a new
-  terminal, or a mod pane), `pane.close {pane?, close_context?: {mode: "automatic"}}`,
+  terminal, or a mod pane), `pane.close {pane?, close_context?: {mode: "automatic", handoff: string}}`,
   `pane.zoom {pane?}`, `pane.focus {pane | terminal}`, `pane.go {direction}`, `pane.swap {direction}`.
   `pane.go` prefers the most recently focused pane along the nearest edge in that
   direction; unvisited panes fall back to overlap, then top/left layout order.
