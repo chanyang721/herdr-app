@@ -9,7 +9,7 @@ The native base is app v0.1.13 (93b097f).
 The app sends one `terminal.kill_batch` request:
 
 ```json
-{"roots":["t7"],"expected":[{"address":"t7","pid":700,"created_ms":100007}],"context":{"mode":"automatic","handoff":"<one-use local capability>"}}
+{"operation_id":"appclose<unique-id>","roots":["t7"],"expected":[{"address":"t7","pid":700,"created_ms":100007}],"context":{"mode":"automatic","handoff":"<one-use local capability>"}}
 ```
 
 `expected` is the exact set of selected roots and their unkept descendants.
@@ -20,7 +20,8 @@ missing-child, identity-mismatched and remote sets are refused as a whole. The
 batch endpoint requires its configured external guard; no guard means denial.
 There is no fallback to a single-terminal kill.
 
-Only `{ok:true,terminated:[exact expected identities]}` counts as success. The app
+The app allocates the operation ID before sending the batch. Only
+`{ok:true,operation_id:<same operation>,terminated:[exact expected identities]}` counts as success. The app
 checks the complete receipt, the connection generation and unchanged close-target
 structure before removing anything. Errors, partial results, timeouts and unknown
 completion retain the session model and its focus. Conflicting structural edits

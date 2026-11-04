@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum Target {
     Space(String),
     Tab(String),
@@ -63,8 +63,10 @@ impl Target {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct Plan {
+    pub operation_id: String,
     pub target: Target,
     pub roots: Vec<String>,
     pub expected: Vec<Identity>,
@@ -82,10 +84,11 @@ impl Plan {
     pub fn execute(&self, context: &Value, call: impl FnOnce(Value) -> Result<Value, String>) -> Result<Completed, String> {
         validate_context(context)?;
         if self.expected.is_empty() { return self.completed(vec![]); }
-        let mut params = json!({"roots": self.roots, "expected": self.expected});
+        let mut params = json!({"operation_id": self.operation_id, "roots": self.roots, "expected": self.expected});
         if !context.is_null() { params["context"] = context.clone(); }
         let reply = call(params)?;
-        if reply.get("ok").and_then(Value::as_bool) != Some(true) {
+        if reply.get("ok").and_then(Value::as_bool) != Some(true)
+            || reply.get("operation_id").and_then(Value::as_str) != Some(self.operation_id.as_str()) {
             return Err("guarded close batch did not succeed".into());
         }
         let terminated = serde_json::from_value(reply.get("terminated").cloned().unwrap_or(Value::Null))
@@ -117,7 +120,10 @@ impl Plan {
             let record = live.get(address).ok_or_else(|| format!("close lookup missing: {address}"))?;
             Identity::read(address, record)
         }).collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { target, roots, expected, stamp })
+        use std::hash::{BuildHasher, Hasher};
+        let random = || std::collections::hash_map::RandomState::new().build_hasher().finish();
+        let operation_id = format!("appclose{:016x}{:016x}", random(), random());
+        Ok(Self { operation_id, target, roots, expected, stamp })
     }
 
     /// Even a core success cannot delete a container that acquired other content meanwhile.
@@ -299,12 +305,28 @@ mod tests {
         let result=plan.execute(&json!({"mode":"automatic","handoff":"one-use-test-capability"}),|params| {
             assert_eq!(params["context"],json!({"mode":"automatic","handoff":"one-use-test-capability"}));
             assert_eq!(params["roots"],json!(["t1"]));
-            Ok(json!({"ok":true,"terminated":plan.expected}))
+            Ok(json!({"ok":true,"operation_id":plan.operation_id,"terminated":plan.expected}))
         });
         plan.finish(&mut model,result).unwrap();
         assert!(model.space("s").is_none());
         for context in [json!({"mode":"automatic"}),json!({"mode":"automatic","handoff":""}),json!({}),json!({"mode":"manual"}),json!({"mode":"automatic","force":true})] {
             assert!(plan.execute(&context,|_|panic!("invalid context reached the core")).is_err());
+        }
+    }
+
+    #[test]
+    fn operation_identity_survives_persistence_and_cannot_accept_another_receipt() {
+        let (model,live)=fixture();
+        let plan=Plan::capture(Target::Pane("p".into()),&model,&live).unwrap();
+        let restored:Plan=serde_json::from_value(serde_json::to_value(&plan).unwrap()).unwrap();
+        assert_eq!(restored.operation_id,plan.operation_id);
+        assert_eq!(restored.expected,plan.expected);
+        assert_ne!(plan.operation_id,Plan::capture(Target::Pane("p".into()),&model,&live).unwrap().operation_id);
+        for op in [Value::Null,json!("another-operation")] {
+            assert!(restored.execute(&Value::Null,|params| {
+                assert_eq!(params["operation_id"],plan.operation_id);
+                Ok(json!({"ok":true,"operation_id":op,"terminated":plan.expected}))
+            }).is_err());
         }
     }
 
