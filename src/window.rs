@@ -427,6 +427,8 @@ pub struct AppWindow {
     retained_closes: BTreeMap<String, close::Plan>,
     close_evidence_error: Option<String>,
     automatic_close_pending: bool,
+    natural_audit_attempted: HashSet<String>,
+    natural_snapshot_checked: HashMap<String, Instant>,
     close_deferred_documents: Vec<(Option<Value>, Vec<(String, crate::mirror_sync::Outcome)>)>,
     pending_terminals: std::collections::BTreeMap<String, PendingTerminalChange>,
     /// Each machine owns a document; the empty key is this core.
@@ -527,6 +529,8 @@ impl AppWindow {
             retained_closes,
             close_evidence_error,
             automatic_close_pending: false,
+            natural_audit_attempted: HashSet::new(),
+            natural_snapshot_checked: HashMap::new(),
             close_deferred_documents: Vec::new(),
             pending_terminals: Default::default(),
             documents: {
@@ -2145,6 +2149,11 @@ impl AppWindow {
         let missing = self.model.tabs().flat_map(|c| c.root.terminals())
             .filter_map(|n| n.terminal().filter(|a| !self.live.contains_key(*a) && !self.just_born(a)).map(|a| (n.id.clone(), a.to_owned())))
             .collect::<Vec<_>>();
+        if self.pending_close.is_none()
+            && let Some((_,address))=missing.iter().find(|(_,a)|!self.close_holds.contains(a) && !self.natural_audit_attempted.contains(a)
+                && !self.closing_terminals.get(a).copied().unwrap_or(false)) {
+            self.begin_natural_audit(close::Target::Terminal(address.clone()),true,window,cx);
+        }
         let missing = missing.into_iter().filter(|(_, address)| close::may_prune(self.closing_terminals.get(address).copied().unwrap_or(false), self.close_holds.contains(address))).collect::<Vec<_>>();
         if !missing.is_empty() && !self.checking_closed {
             self.check_closed(missing, window, cx);
@@ -2306,7 +2315,11 @@ impl AppWindow {
         // A natural exit/--rm is an observation, not a batch authorization.
         let represented = self.model.address_of(block)
             .or_else(|| self.chrome.find(block).and_then(Node::terminal).map(str::to_owned));
-        if represented.is_some_and(|address| !close::may_prune(self.closing_terminals.get(&address).copied().unwrap_or(false), self.close_holds.contains(&address))) { return; }
+        if let Some(address)=represented
+            && !close::may_prune(self.closing_terminals.get(&address).copied().unwrap_or(false),self.close_holds.contains(&address)) {
+            if !self.close_holds.contains(&address) {self.begin_natural_audit(close::Target::Terminal(address),true,window,cx);}
+            return;
+        }
         if let Some(pane) = block.strip_suffix(SWAP) {
             self.swapped.remove(pane);
             self.focused_pane = None;
@@ -2675,9 +2688,9 @@ impl AppWindow {
         if let Err(error) = close::validate_context(&context) { return self.fail(error); }
         let retained=recovery.or_else(||self.retained_closes.values().find(|p|p.target==target && p.represented(&self.model)).cloned());
         let recovering=retained.is_some();
-        let plan=match retained.map(Ok).unwrap_or_else(||close::Plan::capture(target,&self.model,&self.live)) {
+        let plan=match retained.map(Ok).unwrap_or_else(||close::Plan::capture(target.clone(),&self.model,&self.live)) {
             Ok(plan)=>plan,
-            Err(error)=>return self.fail(error),
+            Err(_error)=>return self.begin_natural_audit(target,false,window,cx),
         };
         if plan.expected.is_empty() {
             let result = plan.finish(&mut self.model, plan.completed(vec![]));
@@ -2704,7 +2717,8 @@ impl AppWindow {
             let work = plan.clone();
             let result = cx.background_executor().spawn(async move {
                 if recovering {
-                    work.reconcile(|params|core.call_timeout("terminal.close_reconcile",params,Duration::from_secs(300)).map_err(|error|format!("{error:#}")))
+                    work.reconcile_guarded(|params|core.call_timeout("terminal.close_reconcile",params,Duration::from_secs(300))
+                        .map_err(|error|close::CallFailure {kind:crate::hc::error_kind(&error).map(str::to_owned),message:format!("{error:#}")}))
                 } else {
                     work.execute_guarded(&context, |params| core.call_timeout("terminal.kill_batch", params, Duration::from_secs(300))
                         .map_err(|error| close::CallFailure {
@@ -2716,50 +2730,110 @@ impl AppWindow {
                 this.pending_close.take();
                 this.automatic_close_pending=false;
                 if this.draining || generation != this.core_generation { return; }
-                let result=match result {
-                    Ok(close::Resolution::Closed(completed))=>Ok(completed),
-                    Ok(close::Resolution::Cancelled)=>{
-                        // This proof certifies no signal, not successful termination.
-                        // Preserve the entire model, retire the hold, require a new request.
-                        if let Err(error)=close::remove_pending(&file("close-pending"),&plan) {
-                            this.layout_notice("Close recovery could not be saved",&error,window,cx);
-                        } else {
-                            this.retained_closes.remove(&plan.operation_id);
-                            for identity in &plan.expected { this.close_holds.remove(&identity.address); }
-                            this.layout_notice("Close was cancelled before termination","The layout is unchanged. Retry close when ready.",window,cx);
-                        }
-                        for (machines,results) in std::mem::take(&mut this.close_deferred_documents) {
-                            this.documents_updated(machines,results,window,cx);
-                        }
-                        return;
-                    }
-                    Err(error)=>Err(error),
-                };
-                let finished=if recovering {plan.finish_reconciled(&mut this.model,result)}else{plan.finish(&mut this.model,result)};
-                match finished {
-                    Ok(()) => {
-                        // Keep durable evidence: a document write or process can fail after
-                        // this callback. A later app can still reconcile the original op.
-                        this.retained_closes.remove(&plan.operation_id);
-                        let blocks = this.chrome.terminals().iter().filter(|node| node.terminal().is_some_and(|address| plan.expected.iter().any(|identity| identity.address == address)))
-                            .map(|node| node.id.clone()).collect::<Vec<_>>();
-                        for block in blocks { this.chrome.remove(&block); }
-                        for identity in &plan.expected {
-                            this.close_holds.remove(&identity.address);
-                            this.closing_terminals.insert(identity.address.clone(), true);
-                        }
-                        this.sync(window, cx);
-                        this.flush_documents(false, window, cx);
-                    }
-                    Err(error) => {
-                        // Keep holds: timeout/partial termination is never permission to prune.
-                        this.layout_notice("Session close refused", &error, window, cx);
-                    }
-                }
-                for (machines,results) in std::mem::take(&mut this.close_deferred_documents) {
-                    this.documents_updated(machines,results,window,cx);
-                }
+                this.complete_close_request(&plan,result,recovering,window,cx);
 
+            });
+        }).detach();
+    }
+
+    fn complete_close_request(&mut self, plan: &close::Plan, result: Result<close::Resolution,String>, recovering: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let result=match result {
+            Ok(close::Resolution::Closed(completed))=>Ok(completed),
+            Ok(close::Resolution::Cancelled)=>{
+                // This proof certifies no signal, not successful termination.
+                // Preserve the entire model, retire the hold, require a new request.
+                if let Err(error)=close::remove_pending(&file("close-pending"),&plan) {
+                    self.layout_notice("Close recovery could not be saved",&error,window,cx);
+                } else {
+                    self.retained_closes.remove(&plan.operation_id);
+                    for identity in &plan.expected { self.close_holds.remove(&identity.address); }
+                    self.layout_notice("Close was cancelled before termination","The layout is unchanged. Retry close when ready.",window,cx);
+                }
+                for (machines,results) in std::mem::take(&mut self.close_deferred_documents) {
+                    self.documents_updated(machines,results,window,cx);
+                }
+                return;
+            }
+            Err(error)=>Err(error),
+        };
+        let finished=if recovering {plan.finish_reconciled(&mut self.model,result)}else{plan.finish(&mut self.model,result)};
+        match finished {
+            Ok(()) => {
+                // Keep durable evidence: a document write or process can fail after
+                // this callback. A later app can still reconcile the original op.
+                self.retained_closes.remove(&plan.operation_id);
+                let blocks = self.chrome.terminals().iter().filter(|node| node.terminal().is_some_and(|address| plan.expected.iter().any(|identity| identity.address == address)))
+                    .map(|node| node.id.clone()).collect::<Vec<_>>();
+                for block in blocks { self.chrome.remove(&block); }
+                for identity in &plan.expected {
+                    self.close_holds.remove(&identity.address);
+                    self.closing_terminals.insert(identity.address.clone(), true);
+                }
+                self.sync(window, cx);
+                self.flush_documents(false, window, cx);
+            }
+            Err(error) => {
+                // Keep holds: timeout/partial termination is never permission to prune.
+                self.layout_notice("Session close refused", &error, window, cx);
+            }
+        }
+        for (machines,results) in std::mem::take(&mut self.close_deferred_documents) {
+            self.documents_updated(machines,results,window,cx);
+        }
+
+    }
+
+
+    /// An existing exit/missing-pane event requests a signal-free audit. It
+    /// never restores blanket prune permission and never starts a new kill.
+    fn begin_natural_audit(&mut self, target: close::Target, observation: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_close.is_some() || self.draining || !self.changing_terminals.is_empty() { return; }
+        let draft=match close::Plan::audit_draft(target,&self.model) {
+            Ok(plan)=>plan,
+            Err(error)=>{ if !observation {self.fail(error);} return; }
+        };
+        if draft.roots.iter().any(|a|self.close_holds.contains(a)) { if !observation {self.fail("reconcile the original held operation first");} return; }
+        if observation && draft.roots.iter().any(|a|self.natural_audit_attempted.contains(a)
+            || self.natural_snapshot_checked.get(a).is_some_and(|at|at.elapsed()<Duration::from_secs(30))) { return; }
+        if let Some(error)=&self.close_evidence_error { if !observation {self.fail(format!("retained close evidence requires recovery: {error}"));} return; }
+        if !close::supported(&self.core.hello) || !self.core.hello["methods"].as_array().is_some_and(|m|m.iter().any(|v|v=="terminal.close_snapshot")) {
+            if !observation {self.fail("core lacks guarded natural-exit audit support");} return;
+        }
+        let core_id=self.core.hello["core"]["id"].as_str().unwrap_or_default().to_owned();
+        if core_id.is_empty() { if !observation {self.fail("missing native core identity");} return; }
+        for address in &draft.roots { self.natural_snapshot_checked.insert(address.clone(),Instant::now()); }
+        self.pending_close=Some(draft.clone());
+        if !observation { self.answer(Ok(json!({"pending":true,"operation":"natural_exit_audit","operation_id":draft.operation_id}))); }
+        let core=self.core.clone();let generation=self.core_generation;
+        cx.spawn_in(window,async move |this,cx| {
+            let core_id_check=core_id.clone();
+            let (plan,result)=cx.background_executor().spawn(async move {
+                let prepared=(|| {
+                    let snapshot=core.call_timeout("terminal.close_snapshot",json!({"roots":draft.roots}),Duration::from_secs(15)).map_err(|e|format!("{e:#}"))?;
+                    let plan=draft.audit_snapshot(&core_id,snapshot)?;
+                    close::save_pending(&file("close-pending"),&core_id,&plan)?;
+                    Ok::<_,String>(plan)
+                })();
+                let plan=match prepared {Ok(plan)=>plan,Err(error)=>return (None,Err(error))};
+                let result=plan.reconcile_guarded(|params|core.call_timeout("terminal.close_reconcile",params,Duration::from_secs(300))
+                    .map_err(|error|close::CallFailure {kind:crate::hc::error_kind(&error).map(str::to_owned),message:format!("{error:#}")}));
+                (Some(plan),result)
+            }).await;
+            let _=this.update_in(cx,|this,window,cx| {
+                this.pending_close.take();
+                if this.core.hello["core"]["id"].as_str()!=Some(core_id_check.as_str()) { return; }
+                if let Some(plan)=plan {
+                    this.natural_audit_attempted.extend(plan.roots.iter().cloned());
+                    this.close_holds.extend(plan.expected.iter().map(|i|i.address.clone()));
+                    this.retained_closes.insert(plan.operation_id.clone(),plan.clone());
+                    if this.draining || generation!=this.core_generation { return; }
+                    this.complete_close_request(&plan,result,true,window,cx);
+                } else if let Err(error)=result {
+                    // Only read-only snapshot/preparation ran; no core operation
+                    // was submitted and no hold or cleanup is justified.
+                    if !observation {this.layout_notice("Natural-exit audit unavailable",&error,window,cx);}
+                    else {tracing::debug!("natural-exit audit retained pane: {error}");}
+                }
             });
         }).detach();
     }

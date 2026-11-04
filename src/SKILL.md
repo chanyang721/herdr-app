@@ -140,7 +140,8 @@ no single-terminal fallback. Uncertain operations retain a durable plan: retry
 the same target to reconcile its original operation without another kill. Use
 `terminal.close_reconcile {operation_id}` when the original container vanished. An
 exact audited receipt clears only original panes, preserving new content.
-Unbound natural exits remain visible. `pane.close` accepts `close_context: {mode:
+Natural exits need a read-only native snapshot and signal-free audit of their
+pre-exit binding plus actual Exit witness; unbound exits remain visible. `pane.close` accepts `close_context: {mode:
 "automatic", handoff: "<one-use capability>"}` for lifecycle automation; the core passes it to the policy helper
 so automatic timing/focus/last-pane protections remain in force. Omission is an
 explicit/manual close. Unverified exit/rm events retain their session panes.

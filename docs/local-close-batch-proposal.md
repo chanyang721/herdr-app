@@ -4,6 +4,9 @@ Contract agreed on 2026-11-05. This adapter is source-only until integration and
 review pass. No release or installed application/core update is part of this work.
 The native base is app v0.1.13 (93b097f).
 
+See [installation order and compatibility checks](close-guard-install.md).
+The core/helper must be reviewed and applied before the matching app.
+
 ## RPC and complete target identity
 
 The app sends one `terminal.kill_batch` request:
@@ -87,10 +90,19 @@ into the already focused terminal remains available during preparation. Core
 input generations invalidate stale approvals and the native READY/commit fence
 refuses input only at that boundary; helper report requests use this same rule.
 
-Natural exits without an original guarded operation are not yet a recoverable
-close. Native immutable identity/input-generation/session bindings and actual
-Exit witnesses are required for a separate audit operation; old unbound or
-not_found records remain denied. A definite denial before READY carries native RPC `error.data.kind=close_retry_safe`.
+Natural exits use a separate signal-free audit. Existing exit/missing-pane events
+request a read-only terminal.close_snapshot with the original roots. The app
+checks the actual core ID, complete unique identities, input generations and
+all-ended actual Exit witnesses, then durably seals the original UI plan before
+calling terminal.close_reconcile with a new audit-only operation. Only the helper
+can approve the pre-exit binding and current report/review/acceptance/learning;
+the snapshot grants no authority. A pending original operation must use its
+original reconciliation instead. Old/unbound/not-found records remain visible.
+The app submits one audit per observed address per app run; after reporting
+is completed, an explicit close can retry. A read-only snapshot that races actual
+Exit recording can be queried again by the existing missing-pane check after a
+30-second cooldown; it never submits a kill or silently releases a hold. A live/mixed closure is refused without
+changing any pane. An audit plan can never call terminal.kill_batch. A definite denial before READY carries native RPC `error.data.kind=close_retry_safe`.
 The app reads that structured kind from the response to its original batch call
 and retires its pending plan without any reconciliation attempt or UI cleanup.
 The helper can send a missing-report request during preparation: native input

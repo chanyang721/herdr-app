@@ -530,7 +530,9 @@ An uncertain result keeps its original operation evidence. Retry the same target
 to reconcile that operation without sending another kill, or use
 `terminal.close_reconcile {operation_id}` if its original container moved or
 vanished; only an exact audited
-receipt removes the original panes. Unbound natural exits remain visible. A native `close_retry_safe` denial certifies
+receipt removes the original panes. Natural exits are removed only after a read-only native snapshot and signal-free
+helper audit of their pre-exit binding and actual Exit witness. Unbound natural
+exits remain visible. A native `close_retry_safe` denial certifies
 no signal was sent: the layout stays intact and a later close uses a new operation.
 Timeouts and unknown results require original-operation reconciliation.
 Unverified natural exits and removed core records keep their panes. App quit
@@ -1033,3 +1035,9 @@ including a small herdr-core skill you can install with the user's permission.
 - One mod per idea. Don't edit `AGENTS.md` or the `.d.ts` files (the app
   rewrites them). Don't touch other mods unless the request
   needs it.
+
+The local close-guard app requires the matching reviewed core/helper first:
+terminal.kill_batch, terminal.close_reconcile, and terminal.close_snapshot.
+A core version alone does not establish compatibility. Install the app last after
+isolated validation and review. The automatic idle closer leaves the last session
+of the last workspace for a person to close manually.

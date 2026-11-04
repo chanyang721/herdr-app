@@ -67,6 +67,8 @@ impl Target {
 #[serde(deny_unknown_fields)]
 pub(super) struct Plan {
     pub operation_id: String,
+    #[serde(default)]
+    pub audit_only: bool,
     pub target: Target,
     pub roots: Vec<String>,
     pub expected: Vec<Identity>,
@@ -90,6 +92,7 @@ impl Plan {
     /// Transport is supplied by the caller; unit tests never reach a real core.
     pub fn execute(&self, context: &Value, call: impl FnOnce(Value) -> Result<Value, String>) -> Result<Completed, String> {
         validate_context(context)?;
+        if self.audit_only { return Err("an audit plan cannot send a kill".into()); }
         if self.expected.is_empty() { return self.completed(vec![]); }
         let mut params = json!({"operation_id": self.operation_id, "roots": self.roots, "expected": self.expected});
         if !context.is_null() { params["context"] = context.clone(); }
@@ -161,7 +164,76 @@ impl Plan {
             let address=n.terminal()?;
             expected.iter().any(|i|i.address==address).then(||(n.id.clone(),address.to_owned()))
         }).collect();
-        Ok(Self { operation_id, target, roots, expected, stamp, panes })
+        Ok(Self { operation_id, audit_only:false, target, roots, expected, stamp, panes })
+    }
+
+    /// Capture UI scope before a read-only query; never interpret an empty
+    /// draft identity set as a mod-only close or permission to change the model.
+    pub fn audit_draft(target: Target, model: &Model) -> Result<Self,String> {
+        let roots=target.roots(model)?;
+        if roots.is_empty() { return Err("no terminal to audit".into()); }
+        if roots.iter().any(|a|a.is_empty()||a.contains('/')) { return Err("remote audit is not verified".into()); }
+        let remote=match &target {
+            Target::Space(id)=>model.space(id),
+            Target::Tab(id)|Target::Pane(id)=>model.space_of(id),
+            Target::Terminal(_)=>None,
+        }.and_then(|space|space.machine.as_deref());
+        if remote.is_some() { return Err("remote audit is not verified".into()); }
+        let roots=roots.into_iter().collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
+        let stamp=target.stamp(model)?;
+        let panes=model.tabs().flat_map(|t|t.root.terminals()).filter_map(|n| {
+            let address=n.terminal()?;
+            roots.iter().any(|a|a==address).then(||(n.id.clone(),address.to_owned()))
+        }).collect();
+        use std::hash::{BuildHasher,Hasher};
+        let random=||std::collections::hash_map::RandomState::new().build_hasher().finish();
+        Ok(Self {operation_id:format!("appclose{:016x}{:016x}",random(),random()),audit_only:true,
+            target,roots,expected:vec![],stamp,panes})
+    }
+
+    pub fn audit_snapshot(&self, core_id: &str, snapshot: Value) -> Result<Self,String> {
+        if !self.audit_only || core_id.is_empty() || snapshot["core_id"].as_str()!=Some(core_id) {
+            return Err("natural-exit snapshot core identity mismatch".into());
+        }
+        let roots:Vec<String>=serde_json::from_value(snapshot["roots"].clone()).map_err(|_|"invalid audit roots")?;
+        if roots!=self.roots { return Err("natural-exit snapshot changed roots".into()); }
+        let mut expected:Vec<Identity>=serde_json::from_value(snapshot["expected"].clone()).map_err(|_|"invalid audit identity set")?;
+        expected.sort_by(|a,b|a.address.cmp(&b.address));
+        if expected.is_empty() || expected.windows(2).any(|p|p[0].address==p[1].address)
+            || self.roots.iter().any(|a|!expected.iter().any(|i|&i.address==a)) {
+            return Err("natural-exit snapshot has incomplete or duplicate identities".into());
+        }
+        if snapshot["operations"].as_array().is_some_and(|ops|ops.iter().any(|op|op["acknowledged"]!=true && op["cancelled"]!=true)) {
+            return Err("an original unsettled operation must be reconciled first".into());
+        }
+        let targets=snapshot["targets"].as_array().ok_or("missing native actual Exit witnesses")?;
+        if targets.len()!=expected.len() { return Err("natural-exit snapshot has partial witnesses".into()); }
+        let mut witnessed=BTreeSet::new();
+        for record in targets {
+            let address=record["address"].as_str().ok_or("missing audit address")?;
+            let identity=Identity::read(address,record)?;
+            if !expected.contains(&identity) || !witnessed.insert(address)
+                || record["native_state"]!="finished" || record["observed_exit"]!=true
+                || record["input_generation"].as_u64().is_none()
+                || record["program_started_ms"].as_u64().is_none_or(|t|t==0)
+                || record["turn"].as_u64().is_none() {
+                return Err("natural-exit snapshot is live, changed or lacks actual Exit evidence".into());
+            }
+        }
+        let mut plan=self.clone();plan.expected=expected;Ok(plan)
+    }
+
+    pub fn reconcile_guarded(&self, call: impl FnOnce(Value)->Result<Value,CallFailure>) -> Result<Resolution,String> {
+        let mut failure=None;
+        let result=self.reconcile(|params|call(params).map_err(|error| {
+            let message=error.message.clone();failure=Some(error);message
+        }));
+        // Audit-only operations cannot signal. Only a structured native safe
+        // denial can retire them; uncertain original kill operations stay held.
+        if self.audit_only && failure.as_ref().and_then(|e|e.kind.as_deref())==Some("close_retry_safe") {
+            return Ok(Resolution::Cancelled);
+        }
+        result
     }
 
     /// Even a core success cannot delete a container that acquired other content meanwhile.
@@ -191,6 +263,7 @@ impl Plan {
     }
 
     pub fn completed(&self, mut terminated: Vec<Identity>) -> Result<Completed, String> {
+        if self.audit_only && self.expected.is_empty() { return Err("unprepared audit draft has no completion authority".into()); }
         terminated.sort_by(|a,b| a.address.cmp(&b.address));
         if terminated != self.expected {
             return Err("close batch did not confirm exactly the prepared terminal identities".into());
@@ -247,7 +320,7 @@ fn valid_operation(id: &str) -> bool {
 
 pub(super) fn save_pending(dir: &std::path::Path, core_id: &str, plan: &Plan) -> Result<(), String> {
     use std::io::Write;
-    if core_id.is_empty() || !valid_operation(&plan.operation_id) { return Err("missing close core/operation identity".into()); }
+    if core_id.is_empty() || !valid_operation(&plan.operation_id) || plan.expected.is_empty() || plan.roots.is_empty() { return Err("missing close core/operation identity or prepared scope".into()); }
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let path=dir.join(format!("{}.json",plan.operation_id));
     let text=serde_json::to_vec(&Saved {core_id:core_id.into(),plan:plan.clone()}).map_err(|e|e.to_string())?;
@@ -266,6 +339,7 @@ pub(super) fn load_pending(dir: &std::path::Path, core_id: &str) -> Result<BTree
         let path=entry.map_err(|e|e.to_string())?.path();
         if path.extension().and_then(|s|s.to_str()) != Some("json") { continue; }
         let saved:Saved=serde_json::from_slice(&std::fs::read(&path).map_err(|e|e.to_string())?).map_err(|e|format!("invalid retained close evidence: {e}"))?;
+        if saved.plan.expected.is_empty() || saved.plan.roots.is_empty() { return Err(format!("unprepared retained close evidence: {}",path.display())); }
         if !valid_operation(&saved.plan.operation_id) || path.file_stem().and_then(|s|s.to_str())!=Some(&saved.plan.operation_id) {
             return Err("retained close operation identity mismatch".into());
         }
@@ -527,6 +601,67 @@ mod tests {
         }
     }
 
+    fn audit_snapshot(plan:&Plan, live:&HashMap<String,Value>)->Value {
+        let expected=live.iter().map(|(a,r)|Identity::read(a,r).unwrap()).collect::<Vec<_>>();
+        json!({"core_id":"core-a","roots":plan.roots,"expected":expected,"operations":[],
+            "targets":live.values().map(|r|json!({"address":r["address"],"pid":r["pid"],"created_ms":r["created_ms"],
+                "input_generation":7,"program_started_ms":100,"turn":2,"native_state":"finished","observed_exit":true})).collect::<Vec<_>>()})
+    }
+
+    #[test]
+    fn natural_exit_requires_actual_witness_and_audited_receipt_never_a_kill() {
+        let (mut model,live)=fixture();
+        let draft=Plan::audit_draft(Target::Space("s".into()),&model).unwrap();
+        assert!(draft.expected.is_empty());
+        assert!(draft.completed(vec![]).is_err());
+        assert!(draft.execute_guarded(&Value::Null,|_|panic!("natural exit sent a kill")).is_err());
+        let plan=draft.audit_snapshot("core-a",audit_snapshot(&draft,&live)).unwrap();
+        assert!(plan.audit_only);
+        assert!(plan.execute_guarded(&Value::Null,|_|panic!("prepared audit sent a kill")).is_err());
+        let rejected=plan.reconcile_guarded(|_|Err(CallFailure{kind:Some("close_denied".into()),message:"missing live binding or acceptance".into()}));
+        assert!(rejected.is_err());
+        assert!(model.space("s").is_some());
+        let result=plan.reconcile(|p| {
+            assert_eq!(p["operation_id"],draft.operation_id);
+            Ok(json!({"ok":true,"operation_id":plan.operation_id,"terminated":plan.expected}))
+        }).unwrap();
+        let Resolution::Closed(receipt)=result else {panic!("unexpected cancellation")};
+        plan.finish_reconciled(&mut model,Ok(receipt)).unwrap();
+        assert!(model.space("s").is_none());
+    }
+
+    #[test]
+    fn live_unbound_unknown_changed_and_partial_natural_snapshots_preserve_everything() {
+        let (model,live)=fixture();
+        let draft=Plan::audit_draft(Target::Pane("p".into()),&model).unwrap();
+        let good=audit_snapshot(&draft,&live);
+        for (field,value) in [("native_state",json!("live")),("observed_exit",json!(false)),
+            ("input_generation",Value::Null),("program_started_ms",json!(0)),("turn",Value::Null),("pid",json!(0))] {
+            let mut bad=good.clone();bad["targets"][0][field]=value;
+            assert!(draft.audit_snapshot("core-a",bad).is_err(),"{field}");
+        }
+        for field in ["expected","targets","roots","core_id"] {
+            let mut bad=good.clone();bad.as_object_mut().unwrap().remove(field);
+            assert!(draft.audit_snapshot("core-a",bad).is_err());
+        }
+        let mut partial=good.clone();partial["targets"].as_array_mut().unwrap().pop();
+        assert!(draft.audit_snapshot("core-a",partial).is_err());
+        let mut other_operation=good.clone();other_operation["operations"]=json!([{"operation_id":"earlier","acknowledged":false,"cancelled":false}]);
+        assert!(draft.audit_snapshot("core-a",other_operation).is_err());
+        assert!(model.tab("tab").is_some());
+    }
+
+    #[test]
+    fn natural_audit_cancellation_does_not_release_an_uncertain_kill_operation() {
+        let (model,live)=fixture();
+        let draft=Plan::audit_draft(Target::Pane("p".into()),&model).unwrap();
+        let plan=draft.audit_snapshot("core-a",audit_snapshot(&draft,&live)).unwrap();
+        let safe=||Err(CallFailure{kind:Some("close_retry_safe".into()),message:"audit denied before READY".into()});
+        assert!(matches!(plan.reconcile_guarded(|_|safe()),Ok(Resolution::Cancelled)));
+        let kill=Plan::capture(Target::Pane("p".into()),&model,&live).unwrap();
+        assert!(kill.reconcile_guarded(|_|safe()).is_err());
+    }
+
     #[test]
     fn automatic_selection_policy_does_not_turn_manual_focus_into_a_structural_edit() {
         for name in ["pane.focus","pane.go","space.select","tab.select","agent.focus","terminal.show","layout.select"] {
@@ -574,7 +709,7 @@ mod tests {
         assert!(!source.contains("fn kill(&mut self"));
         let full=include_str!("../window.rs");
         assert!(full.contains("automatic close pending; selection is held"));
-        assert!(full.contains("work.reconcile("));
+        assert!(full.contains("work.reconcile_guarded("));
         assert!(full.contains("close::save_pending("));
         assert!(full.contains("close::load_pending("));
         for name in ["space.select","tab.next","pane.focus","agent.focus","layout.select","terminal.show"] { assert!(selection_command(name)); }
