@@ -526,6 +526,9 @@ true`; a later refusal is shown in the window and keeps its session layout.
 Unsupported cores, unverifiable identities and remote targets fail closed.
 There is no fallback to individual kills. `pane.close` automation must pass
 `close_context: {mode: "automatic", handoff: "<one-use capability>"}` to retain automatic-close protections.
+An uncertain result keeps its original operation evidence. Retry the same target
+to reconcile that operation without sending another kill; only an exact audited
+receipt removes the original panes. Unbound natural exits remain visible.
 Unverified natural exits and removed core records keep their panes. App quit
 and window close keep sessions; shutdown hooks cannot bypass the batch gate.
 

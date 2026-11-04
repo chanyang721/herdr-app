@@ -136,7 +136,10 @@ capture or permissions. It needs a running window that has drawn a frame;
 This local fork keeps space/tab/pane close and terminal.kill pending until the
 core's guarded batch returns an exact completion receipt. Refusal, unknown
 identity, unsupported core or remote target leaves the model in place. There is
-no single-terminal fallback. `pane.close` accepts `close_context: {mode:
+no single-terminal fallback. Uncertain operations retain a durable plan: retry
+the same target to reconcile its original operation without another kill. An
+exact audited receipt clears only original panes, preserving new content.
+Unbound natural exits remain visible. `pane.close` accepts `close_context: {mode:
 "automatic", handoff: "<one-use capability>"}` for lifecycle automation; the core passes it to the policy helper
 so automatic timing/focus/last-pane protections remain in force. Omission is an
 explicit/manual close. Unverified exit/rm events retain their session panes.

@@ -71,6 +71,7 @@ pub(super) struct Plan {
     pub roots: Vec<String>,
     pub expected: Vec<Identity>,
     stamp: Value,
+    panes: Vec<(String,String)>,
 }
 
 /// Only an exact, complete batch receipt can produce the value accepted by `finish`.
@@ -86,7 +87,15 @@ impl Plan {
         if self.expected.is_empty() { return self.completed(vec![]); }
         let mut params = json!({"operation_id": self.operation_id, "roots": self.roots, "expected": self.expected});
         if !context.is_null() { params["context"] = context.clone(); }
-        let reply = call(params)?;
+        self.accept_reply(call(params)?)
+    }
+
+    /// Recovery never resends a kill; only the original operation can be reconciled.
+    pub fn reconcile(&self, call: impl FnOnce(Value) -> Result<Value, String>) -> Result<Completed, String> {
+        self.accept_reply(call(json!({"operation_id":self.operation_id,"roots":self.roots,"expected":self.expected}))?)
+    }
+
+    fn accept_reply(&self, reply: Value) -> Result<Completed, String> {
         if reply.get("ok").and_then(Value::as_bool) != Some(true)
             || reply.get("operation_id").and_then(Value::as_str) != Some(self.operation_id.as_str()) {
             return Err("guarded close batch did not succeed".into());
@@ -123,7 +132,11 @@ impl Plan {
         use std::hash::{BuildHasher, Hasher};
         let random = || std::collections::hash_map::RandomState::new().build_hasher().finish();
         let operation_id = format!("appclose{:016x}{:016x}", random(), random());
-        Ok(Self { operation_id, target, roots, expected, stamp })
+        let panes=model.tabs().flat_map(|t| t.root.terminals()).filter_map(|n| {
+            let address=n.terminal()?;
+            expected.iter().any(|i|i.address==address).then(||(n.id.clone(),address.to_owned()))
+        }).collect();
+        Ok(Self { operation_id, target, roots, expected, stamp, panes })
     }
 
     /// Even a core success cannot delete a container that acquired other content meanwhile.
@@ -160,6 +173,23 @@ impl Plan {
         Ok(Completed { identities: terminated, stamp: self.stamp.clone() })
     }
 
+    pub fn represented(&self, model: &Model) -> bool {
+        self.panes.iter().any(|(pane,address)|model.address_of(pane).as_deref()==Some(address.as_str()))
+            || matches!(&self.target,Target::Terminal(_))
+    }
+
+    /// A recovered receipt may clear only the originally captured panes when a
+    /// container changed. New content and moved/replaced pane identities survive.
+    pub fn finish_reconciled(&self, model: &mut Model, result: Result<Completed,String>) -> Result<(),String> {
+        let completed=result?;
+        if completed.identities!=self.expected || completed.stamp!=self.stamp { return Err("foreign close receipt".into()); }
+        if self.unchanged(model).is_ok() { return self.finish(model,Ok(completed)); }
+        for (pane,address) in &self.panes {
+            if model.address_of(pane).as_deref()==Some(address.as_str()) { model.remove_pane(pane); }
+        }
+        Ok(())
+    }
+
     /// The only model mutation in the close protocol. Errors leave even layout/focus intact.
     pub fn finish(&self, model: &mut Model, result: Result<Completed, String>) -> Result<(), String> {
         let completed = result?;
@@ -179,6 +209,49 @@ impl Plan {
         }
         Ok(())
     }
+}
+
+/// The capability/context is deliberately absent from durable app evidence.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Saved { core_id: String, plan: Plan }
+
+fn valid_operation(id: &str) -> bool {
+    id.strip_prefix("appclose").is_some_and(|s| s.len() == 32 && s.bytes().all(|c| c.is_ascii_hexdigit()))
+}
+
+pub(super) fn save_pending(dir: &std::path::Path, core_id: &str, plan: &Plan) -> Result<(), String> {
+    use std::io::Write;
+    if core_id.is_empty() || !valid_operation(&plan.operation_id) { return Err("missing close core/operation identity".into()); }
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let path=dir.join(format!("{}.json",plan.operation_id));
+    let text=serde_json::to_vec(&Saved {core_id:core_id.into(),plan:plan.clone()}).map_err(|e|e.to_string())?;
+    let mut file=std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e|e.to_string())?;
+    file.write_all(&text).and_then(|_| file.sync_all()).map_err(|e| e.to_string())
+}
+
+pub(super) fn load_pending(dir: &std::path::Path, core_id: &str) -> Result<BTreeMap<String,Plan>, String> {
+    let mut plans=BTreeMap::new();
+    let files=match std::fs::read_dir(dir) {
+        Ok(files)=>files,
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>return Ok(plans),
+        Err(e)=>return Err(e.to_string()),
+    };
+    for entry in files {
+        let path=entry.map_err(|e|e.to_string())?.path();
+        if path.extension().and_then(|s|s.to_str()) != Some("json") { continue; }
+        let saved:Saved=serde_json::from_slice(&std::fs::read(&path).map_err(|e|e.to_string())?).map_err(|e|format!("invalid retained close evidence: {e}"))?;
+        if !valid_operation(&saved.plan.operation_id) || path.file_stem().and_then(|s|s.to_str())!=Some(&saved.plan.operation_id) {
+            return Err("retained close operation identity mismatch".into());
+        }
+        if saved.core_id==core_id { plans.insert(saved.plan.operation_id.clone(),saved.plan); }
+    }
+    Ok(plans)
+}
+
+pub(super) fn remove_pending(dir: &std::path::Path, plan: &Plan) -> Result<(), String> {
+    if !valid_operation(&plan.operation_id) { return Err("invalid close operation identity".into()); }
+    std::fs::remove_file(dir.join(format!("{}.json",plan.operation_id))).map_err(|e|e.to_string())
 }
 
 #[cfg(test)]
@@ -331,6 +404,69 @@ mod tests {
     }
 
     #[test]
+    fn lost_ack_survives_restart_and_reconciles_without_live_capture_or_new_kill() {
+        let (mut model,live)=fixture();
+        let plan=Plan::capture(Target::Space("s".into()),&model,&live).unwrap();
+        let dir=std::env::temp_dir().join(&plan.operation_id);
+        save_pending(&dir,"core-a",&plan).unwrap();
+        let attempt=plan.execute(&Value::Null,|_|Err("terminated, but final ACK lost".into()));
+        assert!(plan.finish(&mut model,attempt).is_err());
+        assert!(Plan::capture(Target::Space("s".into()),&model,&HashMap::new()).is_err());
+        let restored=load_pending(&dir,"core-a").unwrap().remove(&plan.operation_id).unwrap();
+        assert!(load_pending(&dir,"other-core").unwrap().is_empty());
+        // A new tab after failure must never be removed with the old space stamp.
+        model.add_tab("s",Tab::new("later","keep","new-pane","t9"));
+        for reply in [Err("helper unavailable".into()),Ok(json!({"ok":true,"operation_id":restored.operation_id,"terminated":restored.expected[..1]})),
+            Ok(json!({"ok":true,"operation_id":"wrong-operation","terminated":restored.expected}))] {
+            assert!(restored.finish_reconciled(&mut model,restored.reconcile(|_|reply)).is_err());
+            assert!(model.tab("tab").is_some());
+            assert_eq!(load_pending(&dir,"core-a").unwrap().len(),1);
+        }
+        let mut calls=0;
+        let result=restored.reconcile(|params| {
+            calls+=1;
+            assert_eq!(params,json!({"operation_id":restored.operation_id,"roots":restored.roots,"expected":restored.expected}));
+            Ok(json!({"ok":true,"operation_id":restored.operation_id,"terminated":restored.expected}))
+        });
+        restored.finish_reconciled(&mut model,result).unwrap();
+        assert_eq!(calls,1);
+        assert!(model.tab("tab").is_none());
+        assert_eq!(model.address_of("new-pane").as_deref(),Some("t9"));
+        remove_pending(&dir,&restored).unwrap();
+        assert!(load_pending(&dir,"core-a").unwrap().is_empty());
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn recovery_never_removes_a_replaced_pane_or_spared_child() {
+        let (mut model,mut live)=fixture();
+        live.get_mut("t2").unwrap()["labels"]=json!({"herdr.space":"s"});
+        model.add_tab("s",Tab::new("kept","keep","kept-pane","t2"));
+        let plan=Plan::capture(Target::Pane("p".into()),&model,&live).unwrap();
+        assert_eq!(plan.expected.len(),1);
+        model.remove_pane("p");
+        model.add_tab("s",Tab::new("replacement","keep","p","t9"));
+        plan.finish_reconciled(&mut model,plan.completed(plan.expected.clone())).unwrap();
+        assert_eq!(model.address_of("p").as_deref(),Some("t9"));
+        assert_eq!(model.address_of("kept-pane").as_deref(),Some("t2"));
+    }
+
+    #[test]
+    fn invalid_retained_evidence_is_not_silently_discarded() {
+        let (model,live)=fixture();
+        let plan=Plan::capture(Target::Pane("p".into()),&model,&live).unwrap();
+        let dir=std::env::temp_dir().join(&plan.operation_id);
+        save_pending(&dir,"core-a",&plan).unwrap();
+        assert!(save_pending(&dir,"core-a",&plan).is_err());
+        let path=dir.join(format!("{}.json",plan.operation_id));
+        let text=std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("handoff"));
+        std::fs::write(&path,"{unfinished").unwrap();
+        assert!(load_pending(&dir,"core-a").is_err());
+        std::fs::remove_file(path).unwrap();std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
     fn command_and_shutdown_paths_cannot_bypass_the_batch_boundary() {
         let source=include_str!("../window.rs").split("    fn dispatch(").nth(1).unwrap();
         for name in ["space.close","tab.close","pane.close","terminal.kill"] {
@@ -340,6 +476,14 @@ mod tests {
             assert!(!branch.contains("self.model.remove_"),"{name} mutates before approval");
         }
         assert!(!source.contains("fn kill(&mut self"));
+        let full=include_str!("../window.rs");
+        assert!(full.contains("automatic close pending; selection is held"));
+        assert!(full.contains("work.reconcile("));
+        assert!(full.contains("close::save_pending("));
+        assert!(full.contains("close::load_pending("));
+        for name in ["space.select","tab.next","pane.focus","agent.focus","layout.select","terminal.show"] { assert!(selection_command(name)); }
+        assert!(!selection_command("app.quit"));
+        assert!(!selection_command("window.close"));
         let mods=include_str!("../mods.rs");
         assert!(!mods.contains("core.call_timeout(&name, args"),"shutdown direct-kill bypass");
         assert!(mods.contains("terminal.kill is unavailable during shutdown"));
@@ -370,3 +514,8 @@ pub(super) fn structural_command(name: &str) -> bool {
 }
 
 pub(super) fn may_prune(completed: bool, held: bool) -> bool { completed && !held }
+
+pub(super) fn selection_command(name: &str) -> bool {
+    name.starts_with("space.") || name.starts_with("tab.") || name.starts_with("pane.") || name.starts_with("agent.") || name.starts_with("layout.")
+        || matches!(name,"terminal.show"|"terminal.peek"|"terminal.search"|"terminal.paste"|"terminal.paste_image"|"mod.open"|"overlay.close"|"app.palette"|"app.settings"|"app.help")
+}

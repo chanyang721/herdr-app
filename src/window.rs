@@ -424,6 +424,9 @@ pub struct AppWindow {
     // Pending/denied operations cannot be pruned by terminal events or reconciliation.
     close_holds: HashSet<String>,
     pending_close: Option<close::Plan>,
+    retained_closes: BTreeMap<String, close::Plan>,
+    close_evidence_error: Option<String>,
+    automatic_close_pending: bool,
     pending_terminals: std::collections::BTreeMap<String, PendingTerminalChange>,
     /// Each machine owns a document; the empty key is this core.
     documents: std::collections::BTreeMap<String, crate::mirror_sync::Slot>,
@@ -465,6 +468,10 @@ impl AppWindow {
         let runtime = ShellRuntime::new(cx).map_err(|e| tracing::error!("script runtime failed, mods are off: {e:#}")).ok();
         mods::note_fonts(cx);
         let seen = std::fs::read_to_string(file("seen.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let retained=close::load_pending(&file("close-pending"),core.hello["core"]["id"].as_str().unwrap_or_default());
+        let close_evidence_error=retained.as_ref().err().cloned();
+        let retained_closes=retained.unwrap_or_default();
+        let close_holds=retained_closes.values().flat_map(|p|p.expected.iter().map(|i|i.address.clone())).collect();
         let mut w = AppWindow {
             core,
             runtime,
@@ -514,8 +521,11 @@ impl AppWindow {
             draining: false,
             changing_terminals: HashSet::new(),
             closing_terminals: HashMap::new(),
-            close_holds: HashSet::new(),
+            close_holds,
             pending_close: None,
+            retained_closes,
+            close_evidence_error,
+            automatic_close_pending: false,
             pending_terminals: Default::default(),
             documents: {
                 let mut local = crate::mirror_sync::Slot::default();
@@ -1362,6 +1372,7 @@ impl AppWindow {
 
     /// Makes `addr` the shown agent; a pane showing it also becomes the focused pane.
     fn focus_agent(&mut self, addr: &str) {
+        if self.automatic_close_pending { return; }
         if let Some(p) = self.model.pane_of(addr) {
             self.model.focus_pane(&p);
         }
@@ -2649,10 +2660,13 @@ impl AppWindow {
         if self.draining || !self.changing_terminals.is_empty() || self.drag.is_some() || self.pane_drag.is_some() {
             return self.fail("terminal/layout change in progress; retry close when settled");
         }
+        if let Some(error)=&self.close_evidence_error { return self.fail(format!("retained close evidence requires recovery: {error}")); }
         if let Err(error) = close::validate_context(&context) { return self.fail(error); }
-        let plan = match close::Plan::capture(target, &self.model, &self.live) {
-            Ok(plan) => plan,
-            Err(error) => return self.fail(error),
+        let retained=self.retained_closes.values().find(|p|p.target==target && p.represented(&self.model)).cloned();
+        let recovering=retained.is_some();
+        let plan=match retained.map(Ok).unwrap_or_else(||close::Plan::capture(target,&self.model,&self.live)) {
+            Ok(plan)=>plan,
+            Err(error)=>return self.fail(error),
         };
         if plan.expected.is_empty() {
             let result = plan.finish(&mut self.model, plan.completed(vec![]));
@@ -2660,21 +2674,39 @@ impl AppWindow {
             self.sync(window, cx);
             return;
         }
+        if !recovering && plan.expected.iter().any(|i|self.close_holds.contains(&i.address)) {
+            return self.fail("an earlier close must be reconciled using its original target");
+        }
+        if !recovering {
+            let core_id=self.core.hello["core"]["id"].as_str().unwrap_or_default();
+            if let Err(error)=close::save_pending(&file("close-pending"),core_id,&plan) { return self.fail(format!("cannot preserve close evidence: {error}")); }
+            self.retained_closes.insert(plan.operation_id.clone(),plan.clone());
+        }
+        self.automatic_close_pending=context["mode"]=="automatic";
         self.close_holds.extend(plan.expected.iter().map(|i| i.address.clone()));
         self.pending_close = Some(plan.clone());
-        self.answer(Ok(json!({"pending":true,"operation":"guarded_close"})));
+        self.answer(Ok(json!({"pending":true,"operation":if recovering {"close_reconcile"}else{"guarded_close"},"operation_id":plan.operation_id})));
         let core = self.core.clone();
         let generation = self.core_generation;
         cx.spawn_in(window, async move |this, cx| {
             let work = plan.clone();
             let result = cx.background_executor().spawn(async move {
-                work.execute(&context, |params| core.call_timeout("terminal.kill_batch", params, Duration::from_secs(300)).map_err(|error| format!("{error:#}")))
+                if recovering {
+                    work.reconcile(|params|core.call_timeout("terminal.close_reconcile",params,Duration::from_secs(300)).map_err(|error|format!("{error:#}")))
+                } else {
+                    work.execute(&context, |params| core.call_timeout("terminal.kill_batch", params, Duration::from_secs(300)).map_err(|error| format!("{error:#}")))
+                }
             }).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.pending_close.take();
+                this.automatic_close_pending=false;
                 if this.draining || generation != this.core_generation { return; }
-                match plan.finish(&mut this.model, result) {
+                let finished=if recovering {plan.finish_reconciled(&mut this.model,result)}else{plan.finish(&mut this.model,result)};
+                match finished {
                     Ok(()) => {
+                        // Keep durable evidence: a document write or process can fail after
+                        // this callback. A later app can still reconcile the original op.
+                        this.retained_closes.remove(&plan.operation_id);
                         let blocks = this.chrome.terminals().iter().filter(|node| node.terminal().is_some_and(|address| plan.expected.iter().any(|identity| identity.address == address)))
                             .map(|node| node.id.clone()).collect::<Vec<_>>();
                         for block in blocks { this.chrome.remove(&block); }
@@ -2812,6 +2844,7 @@ impl AppWindow {
             && let Some(space) = Self::arg(&args, "id").and_then(|id| self.model.space_of(id))
             && let Err(error) = self.require_document(space.machine.as_deref())
         { return json!({"error":error}); }
+        if self.automatic_close_pending && close::selection_command(name) { return json!({"error":"automatic close pending; selection is held"}); }
         if self.pending_close.is_some() && close::structural_command(name) {
             return json!({"error":"guarded close pending; structural changes are held"});
         }
@@ -3096,8 +3129,8 @@ impl AppWindow {
             }
             "terminal.kill" => {
                 let t = Self::arg(a, "terminal").unwrap_or_default();
-                if !self.live.contains_key(t) {
-                    return self.fail(format!("no running terminal {t:?}"));
+                if !self.live.contains_key(t) && !self.retained_closes.values().any(|p|p.target==close::Target::Terminal(t.to_owned())) {
+                    return self.fail(format!("no running terminal or retained close {t:?}"));
                 }
                 return self.begin_close(close::Target::Terminal(t.to_owned()), Value::Null, window, cx);
             }
@@ -3423,6 +3456,7 @@ impl AppWindow {
 
     /// `pane.go`: the nearest pane or focusable mod.
     fn go(&mut self, dir: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.automatic_close_pending { return; }
         let Some(from) = self.focused_block.clone().or_else(|| self.model.focused_pane()) else { return };
         let Some(to) = self.neighbor(&from, dir, true) else { return };
         if self.focusable(&to) {
@@ -3436,6 +3470,7 @@ impl AppWindow {
 
     /// Until the mod takes the keyboard, the window holds the keys.
     fn focus_block(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.automatic_close_pending { return; }
         if self.model.tab_of(id).is_some() {
             self.model.focus_pane(id);
             self.focused_pane = None;
@@ -4059,6 +4094,7 @@ impl AppWindow {
                     div()
                         .size_full()
                         .on_any_mouse_down(cx.listener(move |this, _, _, cx| {
+                            if this.automatic_close_pending { cx.stop_propagation(); return; }
                             // Overlay terminals keep their own focus; chrome blocks share the pane focus API.
                             if this.focused_pane.as_deref() != Some(id.as_str())
                                 && (this.model.tab_of(&id).is_some() || terminal_block(&this.chrome, Some(&id)).is_some())
@@ -4121,6 +4157,7 @@ impl AppWindow {
                 .when(in_pane, |d| {
                     let id = slot.to_owned();
                     d.on_any_mouse_down(cx.listener(move |this, _, _, cx| {
+                        if this.automatic_close_pending { cx.stop_propagation(); return; }
                         if this.focused_pane.as_deref() != Some(id.as_str()) {
                             this.model.focus_pane(&id);
                             this.focused_pane = Some(id.clone());
@@ -4783,10 +4820,10 @@ impl Render for AppWindow {
             .iter()
             .find(|(_, t)| t.focus.is_focused(window))
             .map(|(id, _)| id.clone());
-        if clicked.is_some() && self.focused_block.take().is_some() {
+        if !self.automatic_close_pending && clicked.is_some() && self.focused_block.take().is_some() {
             self.publish(cx);
         }
-        if let Some(id) = clicked
+        if !self.automatic_close_pending && let Some(id) = clicked
             && self.focused_pane.as_deref() != Some(id.as_str())
             && (self.model.tab_of(&id).is_some() || terminal_block(&self.chrome, Some(&id)).is_some())
         {
@@ -4849,12 +4886,16 @@ impl Render for AppWindow {
                 }
             }))
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                if this.automatic_close_pending { cx.stop_propagation(); return; }
                 if ev.keystroke.key == "escape" && this.pane_drag.is_some() {
                     this.cancel_pane_drag(cx);
                     cx.stop_propagation();
                 }
             }))
-            .capture_any_mouse_down(cx.listener(|this, ev: &MouseDownEvent, _, _| this.pointer = ev.position))
+            .capture_any_mouse_down(cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                if this.automatic_close_pending { cx.stop_propagation(); return; }
+                this.pointer=ev.position;
+            }))
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
                 this.drag_window(ev, window);
                 if this.drag.is_none() {

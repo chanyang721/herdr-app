@@ -65,6 +65,30 @@ ACK 30 s; the app RPC wait is bounded to 300 s. No reusable standalone token is
 accepted. Direct kill, remote forwarding, automatic parent cleanup and core
 shutdown are core-side enforcement responsibilities.
 
+## Recovery after an uncertain result
+
+Before any batch RPC, the app durably writes the immutable plan, caller operation
+ID, core ID and original pane/address pairs to `close-pending/<operation>.json`.
+No automatic handoff capability is stored. Invalid evidence blocks new closes
+rather than being silently discarded. Evidence is retained even after successful
+UI cleanup so a failed layout write or app crash cannot lose the recovery key.
+
+Closing the same original target again uses only `terminal.close_reconcile` with
+its original operation_id, roots and expected identities. It never retransmits a
+kill. Only an exact operation-bound receipt allows cleanup. Core/helper must
+verify the original journal, actual Exit witnesses and completed audit again.
+If the container changed, cleanup removes only original pane/address pairs still
+present and preserves new or replaced content. Timeouts, partial receipts, live
+targets and unknown records retain the model, holds and operation evidence.
+Automatic pending requests also hold local keyboard/mouse focus and selection.
+
+Natural exits without an original guarded operation are not yet a recoverable
+close. Native immutable identity/input-generation/session bindings and actual
+Exit witnesses are required for a separate audit operation; old unbound or
+not_found records remain denied. Definite pre-signal denial also needs an
+authenticated cancelled-operation receipt before a new kill may be attempted;
+an arbitrary error or timeout is never enough to release holds.
+
 ## UI bypass protection and limits
 
 `terminal_ended` and `check_closed` do not prune a session on exit, --rm or missing
