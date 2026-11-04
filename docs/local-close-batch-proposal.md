@@ -87,9 +87,10 @@ Automatic pending requests also hold local keyboard/mouse focus and selection.
 Natural exits without an original guarded operation are not yet a recoverable
 close. Native immutable identity/input-generation/session bindings and actual
 Exit witnesses are required for a separate audit operation; old unbound or
-not_found records remain denied. Definite pre-signal denial also needs an
-authenticated cancelled-operation receipt before a new kill may be attempted;
-an arbitrary error or timeout is never enough to release holds.
+not_found records remain denied. For definite pre-signal denial, only an exact operation/identity-bound response
+with `ok:false,state:"cancelled",no_signal:true,expected:[exact original]` retires
+the pending evidence and releases holds. It preserves the entire model and
+requires a new close request. An arbitrary error or timeout never releases holds.
 
 ## UI bypass protection and limits
 

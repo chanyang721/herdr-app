@@ -80,6 +80,8 @@ pub(super) struct Completed {
     stamp: Value,
 }
 
+pub(super) enum Resolution { Closed(Completed), Cancelled }
+
 impl Plan {
     /// Transport is supplied by the caller; unit tests never reach a real core.
     pub fn execute(&self, context: &Value, call: impl FnOnce(Value) -> Result<Value, String>) -> Result<Completed, String> {
@@ -91,8 +93,16 @@ impl Plan {
     }
 
     /// Recovery never resends a kill; only the original operation can be reconciled.
-    pub fn reconcile(&self, call: impl FnOnce(Value) -> Result<Value, String>) -> Result<Completed, String> {
-        self.accept_reply(call(json!({"operation_id":self.operation_id,"roots":self.roots,"expected":self.expected}))?)
+    pub fn reconcile(&self, call: impl FnOnce(Value) -> Result<Value, String>) -> Result<Resolution, String> {
+        let reply=call(json!({"operation_id":self.operation_id,"roots":self.roots,"expected":self.expected}))?;
+        if reply["operation_id"].as_str()==Some(self.operation_id.as_str()) && reply["ok"]==false
+            && reply["state"]=="cancelled" && reply["no_signal"]==true && reply.get("terminated").is_none() {
+            let mut ids:Vec<Identity>=serde_json::from_value(reply["expected"].clone()).map_err(|_|"invalid cancelled close receipt")?;
+            ids.sort_by(|a,b|a.address.cmp(&b.address));
+            if ids==self.expected { return Ok(Resolution::Cancelled); }
+            return Err("cancelled close receipt does not match the complete operation".into());
+        }
+        self.accept_reply(reply).map(Resolution::Closed)
     }
 
     fn accept_reply(&self, reply: Value) -> Result<Completed, String> {
@@ -418,7 +428,7 @@ mod tests {
         model.add_tab("s",Tab::new("later","keep","new-pane","t9"));
         for reply in [Err("helper unavailable".into()),Ok(json!({"ok":true,"operation_id":restored.operation_id,"terminated":restored.expected[..1]})),
             Ok(json!({"ok":true,"operation_id":"wrong-operation","terminated":restored.expected}))] {
-            assert!(restored.finish_reconciled(&mut model,restored.reconcile(|_|reply)).is_err());
+            assert!(restored.finish_reconciled(&mut model,restored.reconcile(|_|reply).and_then(|r|match r {Resolution::Closed(c)=>Ok(c),Resolution::Cancelled=>Err("cancelled".into())})).is_err());
             assert!(model.tab("tab").is_some());
             assert_eq!(load_pending(&dir,"core-a").unwrap().len(),1);
         }
@@ -428,7 +438,8 @@ mod tests {
             assert_eq!(params,json!({"operation_id":restored.operation_id,"roots":restored.roots,"expected":restored.expected}));
             Ok(json!({"ok":true,"operation_id":restored.operation_id,"terminated":restored.expected}))
         });
-        restored.finish_reconciled(&mut model,result).unwrap();
+        let Resolution::Closed(receipt)=result.unwrap() else {panic!("unexpected cancellation")};
+        restored.finish_reconciled(&mut model,Ok(receipt)).unwrap();
         assert_eq!(calls,1);
         assert!(model.tab("tab").is_none());
         assert_eq!(model.address_of("new-pane").as_deref(),Some("t9"));
@@ -449,6 +460,22 @@ mod tests {
         plan.finish_reconciled(&mut model,plan.completed(plan.expected.clone())).unwrap();
         assert_eq!(model.address_of("p").as_deref(),Some("t9"));
         assert_eq!(model.address_of("kept-pane").as_deref(),Some("t2"));
+    }
+
+    #[test]
+    fn only_an_exact_no_signal_cancellation_can_release_a_preflight_hold() {
+        let (model,live)=fixture();
+        let plan=Plan::capture(Target::Space("s".into()),&model,&live).unwrap();
+        let receipt=json!({"ok":false,"operation_id":plan.operation_id,"state":"cancelled","no_signal":true,"expected":plan.expected});
+        assert!(matches!(plan.reconcile(|_|Ok(receipt.clone())),Ok(Resolution::Cancelled)));
+        for key in ["operation_id","state","no_signal","expected"] {
+            let mut bad=receipt.clone();bad.as_object_mut().unwrap().remove(key);
+            assert!(plan.reconcile(|_|Ok(bad)).is_err());
+        }
+        let mut partial=receipt.clone();partial["expected"]=json!([plan.expected[0]]);
+        assert!(plan.reconcile(|_|Ok(partial)).is_err());
+        assert!(plan.reconcile(|_|Err("timeout is not cancellation".into())).is_err());
+        assert!(model.space("s").is_some());
     }
 
     #[test]

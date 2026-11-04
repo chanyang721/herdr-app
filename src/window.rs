@@ -2705,13 +2705,32 @@ impl AppWindow {
                 if recovering {
                     work.reconcile(|params|core.call_timeout("terminal.close_reconcile",params,Duration::from_secs(300)).map_err(|error|format!("{error:#}")))
                 } else {
-                    work.execute(&context, |params| core.call_timeout("terminal.kill_batch", params, Duration::from_secs(300)).map_err(|error| format!("{error:#}")))
+                    work.execute(&context, |params| core.call_timeout("terminal.kill_batch", params, Duration::from_secs(300)).map_err(|error| format!("{error:#}"))).map(close::Resolution::Closed)
                 }
             }).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.pending_close.take();
                 this.automatic_close_pending=false;
                 if this.draining || generation != this.core_generation { return; }
+                let result=match result {
+                    Ok(close::Resolution::Closed(completed))=>Ok(completed),
+                    Ok(close::Resolution::Cancelled)=>{
+                        // This proof certifies no signal, not successful termination.
+                        // Preserve the entire model, retire the hold, require a new request.
+                        if let Err(error)=close::remove_pending(&file("close-pending"),&plan) {
+                            this.layout_notice("Close recovery could not be saved",&error,window,cx);
+                        } else {
+                            this.retained_closes.remove(&plan.operation_id);
+                            for identity in &plan.expected { this.close_holds.remove(&identity.address); }
+                            this.layout_notice("Close was cancelled before termination","The layout is unchanged. Retry close when ready.",window,cx);
+                        }
+                        for (machines,results) in std::mem::take(&mut this.close_deferred_documents) {
+                            this.documents_updated(machines,results,window,cx);
+                        }
+                        return;
+                    }
+                    Err(error)=>Err(error),
+                };
                 let finished=if recovering {plan.finish_reconciled(&mut this.model,result)}else{plan.finish(&mut this.model,result)};
                 match finished {
                     Ok(()) => {
