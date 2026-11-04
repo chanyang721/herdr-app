@@ -5,6 +5,7 @@
 //! anything: keys, mods, menus and agents all run them.
 
 use crate::hc::Core;
+mod close;
 mod floats;
 mod movable;
 mod pane_drag;
