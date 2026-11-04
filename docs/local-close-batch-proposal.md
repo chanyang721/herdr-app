@@ -73,7 +73,9 @@ No automatic handoff capability is stored. Invalid evidence blocks new closes
 rather than being silently discarded. Evidence is retained even after successful
 UI cleanup so a failed layout write or app crash cannot lose the recovery key.
 
-Closing the same original target again uses only `terminal.close_reconcile` with
+The app command `terminal.close_reconcile {operation_id}` also recovers an
+operation whose original container moved or vanished. Closing the same original
+target again uses only `terminal.close_reconcile` with
 its original operation_id, roots and expected identities. It never retransmits a
 kill. Only an exact operation-bound receipt allows cleanup. Core/helper must
 verify the original journal, actual Exit witnesses and completed audit again.

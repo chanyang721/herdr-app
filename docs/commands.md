@@ -173,6 +173,14 @@ End a terminal and its sub-agents.
 |---|---|
 | `terminal` | yes |
 
+## `terminal.close_reconcile`
+
+Reconcile a retained close operation without sending another kill.
+
+| Argument | Required |
+|---|---|
+| `operation_id` | yes |
+
 ## `space.select`
 
 Show a space (by position or id).

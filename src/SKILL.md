@@ -137,7 +137,8 @@ This local fork keeps space/tab/pane close and terminal.kill pending until the
 core's guarded batch returns an exact completion receipt. Refusal, unknown
 identity, unsupported core or remote target leaves the model in place. There is
 no single-terminal fallback. Uncertain operations retain a durable plan: retry
-the same target to reconcile its original operation without another kill. An
+the same target to reconcile its original operation without another kill. Use
+`terminal.close_reconcile {operation_id}` when the original container vanished. An
 exact audited receipt clears only original panes, preserving new content.
 Unbound natural exits remain visible. `pane.close` accepts `close_context: {mode:
 "automatic", handoff: "<one-use capability>"}` for lifecycle automation; the core passes it to the policy helper

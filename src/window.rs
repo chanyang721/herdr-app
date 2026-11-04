@@ -2663,13 +2663,17 @@ impl AppWindow {
 
     /// Do not remove even one pane until the guarded core batch has completed.
     fn begin_close(&mut self, target: close::Target, context: Value, window: &mut Window, cx: &mut Context<Self>) {
+        self.begin_close_request(target,context,None,window,cx);
+    }
+
+    fn begin_close_request(&mut self, target: close::Target, context: Value, recovery: Option<close::Plan>, window: &mut Window, cx: &mut Context<Self>) {
         if self.pending_close.is_some() { return self.fail("another guarded close is pending"); }
         if self.draining || !self.changing_terminals.is_empty() || self.drag.is_some() || self.pane_drag.is_some() {
             return self.fail("terminal/layout change in progress; retry close when settled");
         }
         if let Some(error)=&self.close_evidence_error { return self.fail(format!("retained close evidence requires recovery: {error}")); }
         if let Err(error) = close::validate_context(&context) { return self.fail(error); }
-        let retained=self.retained_closes.values().find(|p|p.target==target && p.represented(&self.model)).cloned();
+        let retained=recovery.or_else(||self.retained_closes.values().find(|p|p.target==target && p.represented(&self.model)).cloned());
         let recovering=retained.is_some();
         let plan=match retained.map(Ok).unwrap_or_else(||close::Plan::capture(target,&self.model,&self.live)) {
             Ok(plan)=>plan,
@@ -3137,6 +3141,11 @@ impl AppWindow {
                         }
                     })
                     .detach();
+            }
+            "terminal.close_reconcile" => {
+                let op=Self::arg(a,"operation_id").unwrap_or_default();
+                let Some(plan)=self.retained_closes.get(op).cloned() else { return self.fail("no retained close operation"); };
+                return self.begin_close_request(plan.target.clone(),Value::Null,Some(plan),window,cx);
             }
             "terminal.kill" => {
                 let t = Self::arg(a, "terminal").unwrap_or_default();

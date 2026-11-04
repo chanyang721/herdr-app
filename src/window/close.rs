@@ -509,7 +509,7 @@ pub(super) fn validate_context(context: &Value) -> Result<(), String> {
 
 pub(super) fn structural_command(name: &str) -> bool {
     matches!(name, "space.new" | "space.close" | "space.rename" | "space.move" | "tab.new" | "tab.close" | "tab.rename" | "tab.move"
-        | "pane.split" | "pane.close" | "pane.swap" | "terminal.open" | "terminal.kill" | "terminal.keep" | "terminal.park"
+        | "pane.split" | "pane.close" | "pane.swap" | "terminal.open" | "terminal.kill" | "terminal.close_reconcile" | "terminal.keep" | "terminal.park"
         | "layout.set" | "layout.reset" | "layout.resize" | "layout.clone" | "layout.switch" | "app.reset")
 }
 
