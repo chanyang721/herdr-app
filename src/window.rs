@@ -2685,6 +2685,7 @@ impl AppWindow {
             self.sync(window, cx);
             return;
         }
+        if !close::supported(&self.core.hello) { return self.fail("core does not support guarded close and recovery; no terminal was signalled"); }
         if !recovering && plan.expected.iter().any(|i|self.close_holds.contains(&i.address)) {
             return self.fail("an earlier close must be reconciled using its original target");
         }

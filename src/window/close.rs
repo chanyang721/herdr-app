@@ -479,6 +479,14 @@ mod tests {
     }
 
     #[test]
+    fn old_cores_are_refused_before_creating_an_unrecoverable_operation() {
+        for hello in [json!({}),json!({"methods":["terminal.kill"]}),json!({"methods":["terminal.kill_batch"]})] {
+            assert!(!supported(&hello));
+        }
+        assert!(supported(&json!({"methods":["terminal.kill_batch","terminal.close_reconcile"]})));
+    }
+
+    #[test]
     fn invalid_retained_evidence_is_not_silently_discarded() {
         let (model,live)=fixture();
         let plan=Plan::capture(Target::Pane("p".into()),&model,&live).unwrap();
@@ -545,4 +553,9 @@ pub(super) fn may_prune(completed: bool, held: bool) -> bool { completed && !hel
 pub(super) fn selection_command(name: &str) -> bool {
     name.starts_with("space.") || name.starts_with("tab.") || name.starts_with("pane.") || name.starts_with("agent.") || name.starts_with("layout.")
         || matches!(name,"terminal.show"|"terminal.peek"|"terminal.search"|"terminal.paste"|"terminal.paste_image"|"mod.open"|"overlay.close"|"app.palette"|"app.settings"|"app.help")
+}
+
+pub(super) fn supported(hello: &Value) -> bool {
+    ["terminal.kill_batch","terminal.close_reconcile"].iter().all(|method|
+        hello["methods"].as_array().is_some_and(|methods|methods.iter().any(|m|m.as_str()==Some(method))))
 }
