@@ -2798,6 +2798,7 @@ impl AppWindow {
     /// A confirmed core layout document must no longer contain the terminal;
     /// current UI absence alone never proves that restart recovery is unnecessary.
     fn cleanup_close_evidence(&mut self) {
+        if !self.retained_closes.values().any(|plan|plan.ui_applied) {return}
         let Some(slot)=self.documents.get("") else {return};
         if !slot.available {return}
         let Some(document)=&slot.document else {return};
