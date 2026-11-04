@@ -78,6 +78,20 @@ pub(super) struct Completed {
 }
 
 impl Plan {
+    /// Transport is supplied by the caller; unit tests never reach a real core.
+    pub fn execute(&self, context: &Value, call: impl FnOnce(Value) -> Result<Value, String>) -> Result<Completed, String> {
+        validate_context(context)?;
+        if self.expected.is_empty() { return self.completed(vec![]); }
+        let mut params = json!({"roots": self.roots, "expected": self.expected});
+        if !context.is_null() { params["context"] = context.clone(); }
+        let reply = call(params)?;
+        if reply.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err("guarded close batch did not succeed".into());
+        }
+        let terminated = serde_json::from_value(reply.get("terminated").cloned().unwrap_or(Value::Null))
+            .map_err(|_| "guarded close batch returned an invalid receipt".to_owned())?;
+        self.completed(terminated)
+    }
     pub fn capture(target: Target, model: &Model, live: &HashMap<String, Value>) -> Result<Self, String> {
         let remote = match &target {
             Target::Space(id) => model.space(id),
@@ -151,7 +165,11 @@ impl Plan {
             Target::Space(id) => { model.remove_space(id); }
             Target::Tab(id) => { model.remove_tab(id); }
             Target::Pane(id) => { model.remove_pane(id); }
-            Target::Terminal(_) => {}
+            Target::Terminal(_) => {
+                for identity in &self.expected {
+                    if let Some(pane) = model.pane_of(&identity.address) { model.remove_pane(&pane); }
+                }
+            }
         }
         Ok(())
     }
@@ -251,4 +269,84 @@ mod tests {
         assert!(other.finish(&mut model,plan.completed(plan.expected.clone())).is_err());
         assert!(model.tab("tab").is_some());
     }
+
+    #[test]
+    fn rpc_refusal_malformed_partial_and_timeout_keep_every_target_unchanged() {
+        for target in [Target::Space("s".into()),Target::Tab("tab".into()),Target::Pane("p".into()),Target::Terminal("t1".into())] {
+            for reply in [Err("unsupported/timeout/EOF".into()),Ok(json!({"ok":false})),Ok(json!({"ok":true})),
+                Ok(json!({"ok":true,"terminated":[{"address":"t1","pid":1,"created_ms":101}]}))] {
+                let (mut model,live)=fixture();
+                let plan=Plan::capture(target.clone(),&model,&live).unwrap();
+                let before=plan.target.stamp(&model).unwrap();
+                let mut calls=0;
+                let result=plan.execute(&Value::Null,|params| {
+                    calls+=1;
+                    assert_eq!(params["expected"].as_array().unwrap().len(),3);
+                    assert!(model.tab("tab").is_some(),"model intact during the RPC");
+                    reply
+                });
+                assert!(plan.finish(&mut model,result).is_err());
+                assert_eq!(calls,1,"one batch only, never single-kill fallback");
+                assert_eq!(plan.target.stamp(&model).unwrap(),before);
+            }
+        }
+    }
+
+    #[test]
+    fn rpc_preserves_automatic_context_and_commits_only_an_exact_success() {
+        let (mut model,live)=fixture();
+        let plan=Plan::capture(Target::Space("s".into()),&model,&live).unwrap();
+        let result=plan.execute(&json!({"mode":"automatic"}),|params| {
+            assert_eq!(params["context"],json!({"mode":"automatic"}));
+            assert_eq!(params["roots"],json!(["t1"]));
+            Ok(json!({"ok":true,"terminated":plan.expected}))
+        });
+        plan.finish(&mut model,result).unwrap();
+        assert!(model.space("s").is_none());
+        for context in [json!({}),json!({"mode":"manual"}),json!({"mode":"automatic","force":true})] {
+            assert!(plan.execute(&context,|_|panic!("invalid context reached the core")).is_err());
+        }
+    }
+
+    #[test]
+    fn command_and_shutdown_paths_cannot_bypass_the_batch_boundary() {
+        let source=include_str!("../window.rs").split("    fn dispatch(").nth(1).unwrap();
+        for name in ["space.close","tab.close","pane.close","terminal.kill"] {
+            let key=format!("\"{name}\" => {{");
+            let branch=source.split(&key).nth(1).unwrap().split("\n            \"").next().unwrap();
+            assert!(branch.contains("self.begin_close("),"{name} lacks batch dispatch");
+            assert!(!branch.contains("self.model.remove_"),"{name} mutates before approval");
+        }
+        assert!(!source.contains("fn kill(&mut self"));
+        let mods=include_str!("../mods.rs");
+        assert!(!mods.contains("core.call_timeout(&name, args"),"shutdown direct-kill bypass");
+        assert!(mods.contains("terminal.kill is unavailable during shutdown"));
+        assert!(!structural_command("app.quit"));
+        assert!(!structural_command("window.close"));
+        for name in ["space.close","tab.close","pane.close","terminal.kill","pane.split","terminal.open"] {
+            assert!(structural_command(name));
+        }
+    }
+
+    #[test]
+    fn observed_exit_and_partial_or_denied_batches_are_not_prune_permission() {
+        assert!(!may_prune(false,false));
+        assert!(!may_prune(false,true));
+        assert!(!may_prune(true,true));
+        assert!(may_prune(true,false));
+    }
 }
+
+pub(super) fn validate_context(context: &Value) -> Result<(), String> {
+    if context.is_null() { return Ok(()); }
+    if context.as_object().is_some_and(|v| v.len() == 1 && v.get("mode").and_then(Value::as_str) == Some("automatic")) { return Ok(()); }
+    Err("close_context must be {mode: automatic} or omitted".into())
+}
+
+pub(super) fn structural_command(name: &str) -> bool {
+    matches!(name, "space.new" | "space.close" | "space.rename" | "space.move" | "tab.new" | "tab.close" | "tab.rename" | "tab.move"
+        | "pane.split" | "pane.close" | "pane.swap" | "terminal.open" | "terminal.kill" | "terminal.keep" | "terminal.park"
+        | "layout.set" | "layout.reset" | "layout.resize" | "layout.clone" | "layout.switch" | "app.reset")
+}
+
+pub(super) fn may_prune(completed: bool, held: bool) -> bool { completed && !held }

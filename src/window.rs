@@ -421,6 +421,9 @@ pub struct AppWindow {
     changing_terminals: HashSet<String>,
     /// Closed terminals stay excluded until kill completes and a listing drops them.
     closing_terminals: HashMap<String, bool>,
+    // Pending/denied operations cannot be pruned by terminal events or reconciliation.
+    close_holds: HashSet<String>,
+    pending_close: Option<close::Plan>,
     pending_terminals: std::collections::BTreeMap<String, PendingTerminalChange>,
     /// Each machine owns a document; the empty key is this core.
     documents: std::collections::BTreeMap<String, crate::mirror_sync::Slot>,
@@ -511,6 +514,8 @@ impl AppWindow {
             draining: false,
             changing_terminals: HashSet::new(),
             closing_terminals: HashMap::new(),
+            close_holds: HashSet::new(),
+            pending_close: None,
             pending_terminals: Default::default(),
             documents: {
                 let mut local = crate::mirror_sync::Slot::default();
@@ -2122,6 +2127,7 @@ impl AppWindow {
         let missing = self.model.tabs().flat_map(|c| c.root.terminals())
             .filter_map(|n| n.terminal().filter(|a| !self.live.contains_key(*a) && !self.just_born(a)).map(|a| (n.id.clone(), a.to_owned())))
             .collect::<Vec<_>>();
+        let missing = missing.into_iter().filter(|(_, address)| close::may_prune(self.closing_terminals.get(address).copied().unwrap_or(false), self.close_holds.contains(address))).collect::<Vec<_>>();
         if !missing.is_empty() && !self.checking_closed {
             self.check_closed(missing, window, cx);
         }
@@ -2279,6 +2285,10 @@ impl AppWindow {
     }
 
     fn terminal_ended(&mut self, block: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // A natural exit/--rm is an observation, not a batch authorization.
+        let represented = self.model.address_of(block)
+            .or_else(|| self.chrome.find(block).and_then(Node::terminal).map(str::to_owned));
+        if represented.is_some_and(|address| !close::may_prune(self.closing_terminals.get(&address).copied().unwrap_or(false), self.close_holds.contains(&address))) { return; }
         if let Some(pane) = block.strip_suffix(SWAP) {
             self.swapped.remove(pane);
             self.focused_pane = None;
@@ -2507,6 +2517,7 @@ impl AppWindow {
                 if generation != this.core_generation { return; }
                 let mut changed = false;
                 for (pane, addr) in closed {
+                    if !close::may_prune(this.closing_terminals.get(&addr).copied().unwrap_or(false), this.close_holds.contains(&addr)) { continue; }
                     if this.model.address_of(&pane).as_deref() == Some(&addr) {
                         this.notify_launch_failure(&addr, window, cx);
                         this.model.remove_pane(&pane);
@@ -2632,42 +2643,54 @@ impl AppWindow {
         }
     }
 
-    /// Kills terminals and their sub-agents, all the way down. Core keeps a
-    /// sub-agent running when its parent dies; closing one here means done with
-    /// its whole tree. Kept sub-agents (given a tab) are the person's: spared.
-    fn kill(&mut self, addresses: &[String], cx: &mut Context<Self>) {
-        let mut doomed: Vec<String> = addresses.to_vec();
-        let mut i = 0;
-        while i < doomed.len() {
-            let parent = doomed[i].clone();
-            for (addr, rec) in &self.live {
-                let child = rec.get("parent").and_then(Value::as_str) == Some(parent.as_str());
-                let kept = rec.get("labels").and_then(|l| l.get("herdr.space")).and_then(Value::as_str).is_some_and(|w| !w.is_empty());
-                if child && !kept && !doomed.contains(addr) {
-                    doomed.push(addr.clone());
-                }
-            }
-            i += 1;
+    /// Do not remove even one pane until the guarded core batch has completed.
+    fn begin_close(&mut self, target: close::Target, context: Value, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_close.is_some() { return self.fail("another guarded close is pending"); }
+        if self.draining || !self.changing_terminals.is_empty() || self.drag.is_some() || self.pane_drag.is_some() {
+            return self.fail("terminal/layout change in progress; retry close when settled");
         }
-        self.closing_terminals.extend(doomed.iter().cloned().map(|a| (a, false)));
-        // Off the UI thread: a kill waits for the program to go, and for slow machines.
+        if let Err(error) = close::validate_context(&context) { return self.fail(error); }
+        let plan = match close::Plan::capture(target, &self.model, &self.live) {
+            Ok(plan) => plan,
+            Err(error) => return self.fail(error),
+        };
+        if plan.expected.is_empty() {
+            let result = plan.finish(&mut self.model, plan.completed(vec![]));
+            if let Err(error) = result { return self.fail(error); }
+            self.sync(window, cx);
+            return;
+        }
+        self.close_holds.extend(plan.expected.iter().map(|i| i.address.clone()));
+        self.pending_close = Some(plan.clone());
+        self.answer(Ok(json!({"pending":true,"operation":"guarded_close"})));
         let core = self.core.clone();
-        cx.spawn(async move |this, cx| {
-            for address in doomed {
-                let core = core.clone();
-                let addr = address.clone();
-                let result = cx.background_executor().spawn(async move {
-                    core.call("terminal.kill", json!({ "terminal": addr }))
-                }).await;
-                let _ = this.update(cx, |this, _| {
-                    if result.is_ok() && this.live.contains_key(&address) {
-                        // The live snapshot may still predate the kill's reply.
-                        this.closing_terminals.insert(address, true);
-                    } else {
-                        this.closing_terminals.remove(&address);
+        let generation = self.core_generation;
+        cx.spawn_in(window, async move |this, cx| {
+            let work = plan.clone();
+            let result = cx.background_executor().spawn(async move {
+                work.execute(&context, |params| core.call_timeout("terminal.kill_batch", params, Duration::from_secs(300)).map_err(|error| format!("{error:#}")))
+            }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.pending_close.take();
+                if this.draining || generation != this.core_generation { return; }
+                match plan.finish(&mut this.model, result) {
+                    Ok(()) => {
+                        let blocks = this.chrome.terminals().iter().filter(|node| node.terminal().is_some_and(|address| plan.expected.iter().any(|identity| identity.address == address)))
+                            .map(|node| node.id.clone()).collect::<Vec<_>>();
+                        for block in blocks { this.chrome.remove(&block); }
+                        for identity in &plan.expected {
+                            this.close_holds.remove(&identity.address);
+                            this.closing_terminals.insert(identity.address.clone(), true);
+                        }
+                        this.sync(window, cx);
+                        this.flush_documents(false, window, cx);
                     }
-                });
-            }
+                    Err(error) => {
+                        // Keep holds: timeout/partial termination is never permission to prune.
+                        this.layout_notice("Session close refused", &error, window, cx);
+                    }
+                }
+            });
         }).detach();
     }
 
@@ -2789,6 +2812,9 @@ impl AppWindow {
             && let Some(space) = Self::arg(&args, "id").and_then(|id| self.model.space_of(id))
             && let Err(error) = self.require_document(space.machine.as_deref())
         { return json!({"error":error}); }
+        if self.pending_close.is_some() && close::structural_command(name) {
+            return json!({"error":"guarded close pending; structural changes are held"});
+        }
         self.reply = None;
         self.dispatch(name, &args, person, window, cx);
         self.flush_documents(false, window, cx);
@@ -2833,6 +2859,9 @@ impl AppWindow {
                 let Some(id) = Self::owned(a, "id").or_else(|| self.model.active.clone()) else { return self.fail("no space to close") };
                 let Some(p) = self.model.space(&id) else { return self.fail(format!("no space {id:?}")) };
                 if a.get("confirmed").and_then(Value::as_bool) != Some(true) {
+                    if a.get("close_context").is_some_and(|v| !v.is_null()) {
+                        return self.fail("automatic close cannot bypass last-space confirmation");
+                    }
                     if !person {
                         return self.fail("space.close ends its terminals: pass confirmed: true");
                     }
@@ -2841,8 +2870,7 @@ impl AppWindow {
                     self.confirm("Close space?", &detail, "space.close", json!({ "id": id, "confirmed": true }), window, cx);
                     return;
                 }
-                let addrs = self.model.remove_space(&id);
-                self.kill(&addrs, cx);
+                return self.begin_close(close::Target::Space(id), a.get("close_context").cloned().unwrap_or(Value::Null), window, cx);
             }
             "space.rename" => {
                 let Some(id) = Self::owned(a, "id").or_else(|| self.model.active.clone()) else { return self.fail("no space to rename") };
@@ -2891,10 +2919,10 @@ impl AppWindow {
                 if p.tabs.len() == 1 {
                     let mut args = json!({ "id": p.id });
                     args["confirmed"] = a.get("confirmed").cloned().unwrap_or(Value::Null);
+                    args["close_context"] = a.get("close_context").cloned().unwrap_or(Value::Null);
                     return self.dispatch("space.close", &args, person, window, cx);
                 }
-                let (addrs, _) = self.model.remove_tab(&id);
-                self.kill(&addrs, cx);
+                return self.begin_close(close::Target::Tab(id), a.get("close_context").cloned().unwrap_or(Value::Null), window, cx);
             }
             "tab.rename" => {
                 let Some(id) = Self::owned(a, "id").or(active_ctx) else { return self.fail("no tab to rename") };
@@ -2960,11 +2988,9 @@ impl AppWindow {
                 }
                 if c.root.panes().len() == 1 {
                     let id = c.id.clone();
-                    return self.dispatch("tab.close", &json!({ "id": id }), person, window, cx);
+                    return self.dispatch("tab.close", &json!({ "id": id, "close_context":a.get("close_context").cloned().unwrap_or(Value::Null) }), person, window, cx);
                 }
-                let addr = self.model.address_of(&pane);
-                self.model.remove_pane(&pane);
-                self.kill(&addr.into_iter().collect::<Vec<_>>(), cx);
+                return self.begin_close(close::Target::Pane(pane), a.get("close_context").cloned().unwrap_or(Value::Null), window, cx);
             }
             "pane.zoom" => {
                 let pane = Self::owned(a, "pane").or_else(|| self.model.focused_pane());
@@ -3073,7 +3099,7 @@ impl AppWindow {
                 if !self.live.contains_key(t) {
                     return self.fail(format!("no running terminal {t:?}"));
                 }
-                self.kill(&[t.to_owned()], cx);
+                return self.begin_close(close::Target::Terminal(t.to_owned()), Value::Null, window, cx);
             }
             "terminal.peek" => {
                 let t = Self::arg(a, "terminal").unwrap_or_default();

@@ -45,7 +45,8 @@ export function playSound(sound: string): null;
  * Runs a command, the same ones keys.json binds (`herdr-app commands` lists them all with their
  * arguments). Structural commands fail while their machine's layout is unavailable.
  * Mod props are stored as given, never machine-qualified. Most commands apply right after
- * the call returns; terminal.keep/park finish in the background and toast on failure.
+ * the call returns; terminal.keep/park and guarded close commands finish in the
+ * background and toast on failure. Closing keeps the model until complete success.
  * A rename without a name is asked for;
  * "" gives the space or tab Herdr's automatic name again. The main ones:
  * Spaces: space.new {name?, folder?, tab?, argv?, task?, machine?}, space.close {id?}, space.rename {id?, name},
@@ -54,7 +55,7 @@ export function playSound(sound: string): null;
  *   or {name?, space?, mod, props?} (a tab whose only pane is a mod),
  *   tab.close {id?}, tab.rename {id?, name}, tab.move {id, index}, tab.select {index | id},
  *   tab.next, tab.prev.
- * Panes: pane.split {direction: "right" | "down", pane?}, pane.close {pane?}, pane.zoom {pane?},
+ * Panes: pane.split {direction: "right" | "down", pane?}, pane.close {pane?, close_context?: CloseContext}, pane.zoom {pane?},
  *   pane.focus {pane | terminal}, pane.go {direction}, pane.swap {direction}. Pane menus get target { pane, terminal }.
  * Terminals: terminal.open {argv?, folder?, place?: "tab" | "right" | "down"}, terminal.kill {terminal},
  *   terminal.keep {terminal, place?} (a running one without a pane, e.g. a sub-agent, gets one),
@@ -77,6 +78,9 @@ export function playSound(sound: string): null;
  * Mods: "<mod>.<command>" delivers <command> to that mod's nextCommand().
  */
 export function run(name: string, args?: Record<string, unknown>): null;
+
+/** Preserves automatic-close protections in the native guarded close transaction. */
+export interface CloseContext { mode: "automatic"; }
 
 export type Status = "working" | "blocked" | "done" | "idle";
 

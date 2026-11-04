@@ -1,91 +1,91 @@
-# Local fork close adapter: proposed batch boundary
+# Local fork guarded close v1
 
-Status: proposal for agreement with the core and lease CLI owners. The app
-dispatcher is not wired until this boundary is agreed. No upstream API change
-or installed binary deployment is included in this preparation.
+Contract agreed on 2026-11-05. This adapter is source-only until integration and
+review pass. No release or installed application/core update is part of this work.
+The native base is app v0.1.13 (93b097f).
 
-The app source is based on release `v0.1.13` (`93b097f`). Its existing
-`space.close`, `tab.close`, `pane.close` and `terminal.kill` must retain the
-complete model until one guarded batch has succeeded. Window close and app quit
-remain available: they do not themselves end terminals.
+## RPC and complete target identity
 
-## Proposed RPC
-
-One native core request, provisionally `terminal.kill_batch`:
+The app sends one `terminal.kill_batch` request:
 
 ```json
-{
-  "roots": ["t7"],
-  "expected": [
-    {"address": "t7", "pid": 700, "created_ms": 100007},
-    {"address": "t8", "pid": 800, "created_ms": 100008}
-  ]
-}
+{"roots":["t7"],"expected":[{"address":"t7","pid":700,"created_ms":100007}],"context":{"mode":"automatic"}}
 ```
 
-`roots` are the explicitly selected terminals. `expected` is the complete exact
-closure of roots and their unkept descendants in the app's observed snapshot.
-A child with a nonempty `herdr.space` label and its subtree are spared unless
-explicitly selected as a root. Address, PID and creation time are mandatory.
-The first implementation refuses every remote address/container.
+`expected` is the exact set of selected roots and their unkept descendants.
+A child with a nonempty `herdr.space` label, and its subtree, are spared unless
+explicitly selected as a root. Every address, PID and creation time is mandatory.
+The core owns fresh closure and input-generation verification. Unknown, duplicate,
+missing-child, identity-mismatched and remote sets are refused as a whole. The
+batch endpoint requires its configured external guard; no guard means denial.
+There is no fallback to a single-terminal kill.
 
-The app currently observes PID and creation time. The core owner must specify
-whether caller-supplied input generation is required and, if so, the exact
-`terminal.get`/`terminal.list` field and snapshot API that supplies it. An
-omitted generation must not be silently treated as proof that input is unchanged.
+Only `{ok:true,terminated:[exact expected identities]}` counts as success. The app
+checks the complete receipt, the connection generation and unchanged close-target
+structure before removing anything. Errors, partial results, timeouts and unknown
+completion retain the session model and its focus. Conflicting structural edits
+and pane drags are held while a close is pending. Commands initially return
+`{pending:true,operation:"guarded_close"}`; this is not a completion receipt.
 
-Proposed success shape (final field names still require agreement):
+## Automatic context
 
-```json
-{
-  "ok": true,
-  "terminated": [
-    {"address": "t7", "pid": 700, "created_ms": 100007},
-    {"address": "t8", "pid": 800, "created_ms": 100008}
-  ]
-}
-```
+`pane.close` accepts optional `close_context:{mode:"automatic"}` and passes that
+object as RPC `context`. Unknown context fields/modes are refused. Internal
+pane-to-tab-to-space escalation retains context and never silently becomes a
+manual close. Automatic escalation cannot bypass last-space confirmation.
+The helper preserves automatic timing, focus, pinning, last-pane and auto_close
+requirements; omission is an explicit/manual request. Core transports context as
+a generic value and does not implement policy itself.
 
-No missing, duplicate, extra or changed identity may count as success. A
-partial result, timeout, unsupported method, missing lookup or guard refusal
-leaves the model unchanged. There is no fallback to individual kill requests.
+## Lease handshake
 
-## Core and lease responsibilities
+The core is configured with an argv array and frozen local machine identity;
+arguments are passed without shell interpolation. The helper command is
+`py -3.12 <checkout>/runtime/harness.py close-guard`. The harness contract is
+recorded in its `docs/close-guard-v1.md` (implementation b077547).
 
-1. Resolve and freeze the complete batch, including descendants, and reject any
-   difference from the caller's expected identities before ending anything.
-2. Acquire the lease CLI's dispatch lock and receive READY for the complete
-   batch. Verify reporting, review, acceptance and learning under that lease.
-3. Immediately recheck every identity, input generation and child membership.
-   Any failure rejects the whole batch, with no per-terminal success prefix.
-4. Hold the lease/pipe through the core's completion or cancellation ACK. The
-   lock must not be dropped between gate approval and core revalidation/kill.
-5. Route direct single-terminal kill through the same guard. Unknown or remote
-   implementations fail closed. Define timeout, EOF, cancellation and error
-   responses explicitly so callers never mistake a lost reply for success.
+- Core sends version 1, operation_id, roots, expected, complete:true and the
+  native target snapshot, including machine_id and input_generation.
+- Helper acquires dispatch.lock, validates reporting/review/acceptance/learning
+  and fresh runtime facts, and sends ready/allow:true with the same operation_id,
+  a random token and exact identities. It retains the lock.
+- Core rechecks the complete closure, identities, input generations and pending
+  input/spawn work before the first signal, then fences new work on the batch.
+- Core sends committed only after every target is observed ended, or cancelled.
+  Both include the matching operation_id and token.
+- Helper independently verifies completion and sends closed/allow:false plus
+  the same operation_id, then exits 0. Only closed plus exit 0 is a final ACK.
+  Denied, unclear, cancelled, EOF, timeout or nonzero exit are not success.
 
-## App integration points
+JSONL lines are bounded to 256 KiB. READY and outcome deadlines are 120 s, final
+ACK 30 s; the app RPC wait is bounded to 300 s. No reusable standalone token is
+accepted. Direct kill, remote forwarding, automatic parent cleanup and core
+shutdown are core-side enforcement responsibilities.
 
-- Capture an immutable close plan before model mutation and return a pending
-  command response while the batch runs off the UI thread.
-- Block conflicting structural edits while the operation is pending and reject
-  an obsolete target/core generation before committing its UI change.
-- Suppress target pruning in `terminal_ended` and `check_closed` until the batch
-  completion has been verified; a stream ending is not a batch approval.
-- Only an exact completion receipt can construct the value accepted by the
-  close plan's model-commit method.
-- `mods.rs` FINAL_KILLS bypasses the normal window dispatcher during shutdown.
-  It must use the same guarded batch boundary or refuse the request; it must
-  never fall back to unguarded single-terminal kill on an older core.
-- Ordinary mod-only pane removal has no terminal batch. Remote container edits
-  remain refused in this first local implementation.
+## UI bypass protection and limits
 
-## Verification
+`terminal_ended` and `check_closed` do not prune a session on exit, --rm or missing
+record observation alone. Pending/failed batches retain holds. Composition
+terminal blocks are also removed only after verified completion. An unverified
+natural exit stays visible; observation is not represented as authorized closure.
+Closing a mod-only local pane has no terminal kill set.
 
-Pure tests use the real app model, layout and mirror code. Prepared cases cover
-all target kinds, complete descendants, missing process identity, PID/creation
-TOCTOU, newly added children, spared kept children, unverified remote roots,
-core/gate refusal preserving model and focus, changed container content,
-successful close scope, and partial/duplicate/extra/foreign completion receipts.
-The dispatcher, RPC fake and automatic-pruning tests are still to be connected
-after the endpoint and lease contract are agreed.
+Shutdown hooks have no retained window transaction and refuse terminal.kill
+instead of sending a direct core call. App quit and window close themselves stay
+available and preserve sessions. A failure does not restore an externally killed
+OS process; it preserves UI/evidence rather than inventing successful termination.
+
+The core must also fence/revalidate policy-relevant input/focus/protection changes
+between READY and commitment. Full core/helper integration and observed runtime
+termination need independent verification; pure app tests do not establish that
+external contract or authorize installation.
+
+## Validation
+
+The real commands/model/layout/mirror/close modules are exercised by pure tests
+with a fake RPC transport. Cases cover all target kinds; exact descendants; kept
+children; missing identities; PID/start/new-child races; remote denial; full UI
+model preservation on refusal/timeout/malformed/partial receipts; foreign and
+duplicate receipts; changed target structure; exact success; automatic context;
+shutdown/direct-kill bypass checks; and unverified exit pruning. Native full
+compilation is checked separately, never inferred from these tests.

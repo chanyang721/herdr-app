@@ -520,6 +520,15 @@ shortcuts must then be added by hand.
 
 ## Commands
 
+In this local fork, space.close, tab.close, pane.close and terminal.kill submit
+one guarded core batch before changing the model. They can report `pending:
+true`; a later refusal is shown in the window and keeps its session layout.
+Unsupported cores, unverifiable identities and remote targets fail closed.
+There is no fallback to individual kills. `pane.close` automation must pass
+`close_context: {mode: "automatic"}` to retain automatic-close protections.
+Unverified natural exits and removed core records keep their panes. App quit
+and window close keep sessions; shutdown hooks cannot bypass the batch gate.
+
 The one way to change anything; keys, mods (`run(name, args)`), menus and
 you use the same list. `herdr-app commands` prints every one with its arguments
 (which are required) and what it does. Unknown argument names are errors and list
@@ -551,7 +560,7 @@ The main ones:
   `tab.settle {id?}`, `tab.unsettle {id?}` (index, next and prev
   skip settled tabs).
 - Panes: `pane.split {direction: "right" | "down", pane?, argv? | mod?, props?}` (a new
-  terminal, or a mod pane), `pane.close {pane?}`,
+  terminal, or a mod pane), `pane.close {pane?, close_context?: {mode: "automatic"}}`,
   `pane.zoom {pane?}`, `pane.focus {pane | terminal}`, `pane.go {direction}`, `pane.swap {direction}`.
   `pane.go` prefers the most recently focused pane along the nearest edge in that
   direction; unvisited panes fall back to overlap, then top/left layout order.
@@ -882,11 +891,11 @@ Rules:
   call when its pane, tab, layout-owned slot or overlay goes, and on app quit.
   It is not called for a hidden copy or an inactive tab. Start cleanup inside
   `close()`; don't await work started earlier. Await cleanup directly,
-  for example `async close(cx) { await exec("hc", ["kill", this.browser]); }`.
+  for example `async close(cx) { await exec("my-helper", ["flush"]); }`.
   Closing stays responsive: cleanup has at most 250 ms (shared across copies
-  on quit), then unfinished tasks are cancelled. On quit, use `exec(...)` and
-  `run("terminal.kill", { terminal: address })`: those go out before the event
-  loop stops; other commands may not run. An `exec` already started keeps
+  on quit), then unfinished tasks are cancelled. On quit, `exec(...)` can be
+  issued before the event loop stops; terminal.kill is refused during shutdown
+  because no guarded window close transaction can be retained. An `exec` already started keeps
   running; don't start new long-lived work in `close`. This is best-effort,
   not a guarantee after a crash or forced termination.
 - Use `theme()` colors so the mod follows the user's theme.

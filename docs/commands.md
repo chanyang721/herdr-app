@@ -117,6 +117,7 @@ Close a pane and end its terminal.
 | Argument | Required |
 |---|---|
 | `pane` | no |
+| `close_context` | no |
 
 ## `terminal.open`
 

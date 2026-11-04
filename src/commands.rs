@@ -40,7 +40,7 @@ pub const COMMANDS: &[Command] = &[
     cmd("tab.rename", &[opt("id"), opt("name")], "Rename a tab (asks the person when no name; an empty name: called by its number again)."),
     cmd("tab.move", &[req("id"), req("index")], "Move a tab to a position in its space (1 = first)."),
     cmd("pane.split", &[req("direction"), opt("pane"), opt("argv"), opt("mod"), opt("props")], "Split a pane (default: the focused one) \"right\" or \"down\" with a new terminal, or with a mod (`mod`, its `props`) beside it."),
-    cmd("pane.close", &[opt("pane")], "Close a pane and end its terminal."),
+    cmd("pane.close", &[opt("pane"), opt("close_context")], "Close a pane and end its terminal."),
     cmd("terminal.open", &[opt("argv"), opt("folder"), opt("place"), opt("name")], "Start a terminal: as a new tab (place \"tab\", default), or \"right\"/\"down\" of the focused pane."),
     cmd("terminal.keep", &[req("terminal"), opt("place")], "Give a running terminal without a pane (a sub-agent) a pane: a new tab, or \"right\"/\"down\"."),
     cmd("terminal.park", &[req("terminal")], "Take a terminal's pane away and disable core keep; it keeps running (a sub-agent shows under its parent again)."),
@@ -133,6 +133,9 @@ pub fn validate_args(c: &Command, args: &Value) -> Result<(), String> {
                 return Err(format!("{}: unknown argument(s): {}; valid arguments: {valid}", c.name, unknown.join(", ")));
             }
             for (key, value) in args {
+                if key == "close_context" && !value.is_null()
+                    && !value.as_object().is_some_and(|v| v.len() == 1 && v.get("mode").and_then(Value::as_str) == Some("automatic"))
+                { return Err(format!("{}: close_context must be {{mode: automatic}} or omitted", c.name)); }
                 if matches!(key.as_str(), "id" | "pane" | "space" | "terminal") && !value.is_string() && !value.is_null() {
                     return Err(format!("{}: argument {key} must be a string (or null to omit it)", c.name));
                 }
@@ -187,7 +190,7 @@ mod tests {
             assert!(validate_args(c, &Value::Null).is_ok());
             assert!(validate_args(c, &json!({})).is_ok());
             assert!(validate_args(c, &json!(["target"])).is_err());
-            let args: serde_json::Map<String, Value> = c.args.iter().map(|a| (a.name.into(), json!("target"))).collect();
+            let args: serde_json::Map<String, Value> = c.args.iter().map(|a| (a.name.into(), if a.name == "close_context" {json!({"mode":"automatic"})} else {json!("target")})).collect();
             assert!(validate_args(c, &Value::Object(args)).is_ok());
         }
         let close = find("space.close").unwrap();
@@ -224,5 +227,14 @@ mod tests {
         assert_eq!(missing(move_, &json!({ "id": "sp1", "index": 1 })), None);
         // Names are optional: none is Herdr's automatic one.
         assert_eq!(missing(find("space.new").unwrap(), &json!({})), None);
+    }
+
+    #[test]
+    fn automatic_close_context_is_explicit_and_cannot_be_malformed() {
+        let c = find("pane.close").unwrap();
+        assert!(validate_args(c, &json!({"pane":"p", "close_context":{"mode":"automatic"}})).is_ok());
+        for value in [json!(true),json!("automatic"),json!({}),json!({"mode":"manual"}),json!({"mode":"automatic","force":true})] {
+            assert!(validate_args(c,&json!({"pane":"p","close_context":value})).is_err());
+        }
     }
 }
