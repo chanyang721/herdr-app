@@ -37,7 +37,7 @@ and pane drags are held while a close is pending. Commands initially return
 object unchanged as RPC `context`. The handoff is a one-use local capability
 consumed by the helper; it is never interpreted by the app or recorded in history. Unknown context fields/modes are refused. Internal
 pane-to-tab-to-space escalation retains context and never silently becomes a
-manual close. Automatic escalation cannot bypass last-space confirmation.
+manual close. Automatic escalation cannot bypass a workspace's final-session confirmation.
 The helper preserves automatic timing, focus, pinning, last-pane and auto_close
 requirements; omission is an explicit/manual request. Core transports context as
 a generic value and does not implement policy itself.
@@ -108,10 +108,14 @@ calling terminal.close_reconcile with a new audit-only operation. Only the helpe
 can approve the pre-exit binding and current report/review/acceptance/learning;
 the snapshot grants no authority. A pending original operation must use its
 original reconciliation instead. Old/unbound/not-found records remain visible.
-The app submits one audit per observed address per app run; after reporting
-is completed, an explicit close can retry. A read-only snapshot that races actual
-Exit recording can be queried again by the existing missing-pane check after a
-30-second cooldown; it never submits a kill or silently releases a hold. A live/mixed closure is refused without
+Observed cleanup uses its own slot, never the person's pending_close lock.
+Read-only failures retry after 30 seconds and then 120 seconds, with at most three
+attempts per address per app run. The pane displays a cleanup-wait reason and an
+explicit close can retry immediately after reporting is completed. Matching
+same-pane requests join the observed operation; other panes' structural commands
+remain available. A prepared observation registers its exact held scope before
+native audit, and its completion waits for any foreground close to finish before
+changing the model. Unknown holds are preserved and no kill is retried. A live/mixed closure is refused without
 changing any pane. An audit plan can never call terminal.kill_batch. A definite denial before READY carries native RPC `error.data.kind=close_retry_safe`.
 The app reads that structured kind from the response to its original batch call
 and retires its pending plan without any reconciliation attempt or UI cleanup.

@@ -26,7 +26,7 @@ baseline. The CI-only app base is not a final integrated release.
    core encountered later causes close commands to refuse before recording a
    new operation, preserving the UI. App/window quit still preserves sessions.
 
-The automatic idle closer leaves the last session of the last workspace for a
+The automatic idle closer leaves each workspace's last session for a
 person to close manually. This protection is intentional. Signal-free post-exit
 audit creates no new termination permission.
 

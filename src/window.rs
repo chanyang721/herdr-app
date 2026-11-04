@@ -428,7 +428,9 @@ pub struct AppWindow {
     close_evidence_error: Option<String>,
     automatic_close_pending: bool,
     natural_audit_attempted: HashSet<String>,
-    natural_snapshot_checked: HashMap<String, Instant>,
+    natural_audit_status: HashMap<String, close::AuditRetry>,
+    observed_audit: Option<close::Plan>,
+    observed_completion: Option<(close::Plan, Result<close::Resolution,String>, u64)>,
     close_deferred_documents: Vec<(Option<Value>, Vec<(String, crate::mirror_sync::Outcome)>)>,
     pending_terminals: std::collections::BTreeMap<String, PendingTerminalChange>,
     /// Each machine owns a document; the empty key is this core.
@@ -530,7 +532,9 @@ impl AppWindow {
             close_evidence_error,
             automatic_close_pending: false,
             natural_audit_attempted: HashSet::new(),
-            natural_snapshot_checked: HashMap::new(),
+            natural_audit_status: HashMap::new(),
+            observed_audit: None,
+            observed_completion: None,
             close_deferred_documents: Vec::new(),
             pending_terminals: Default::default(),
             documents: {
@@ -2155,8 +2159,22 @@ impl AppWindow {
         let missing = self.model.tabs().flat_map(|c| c.root.terminals())
             .filter_map(|n| n.terminal().filter(|a| !self.live.contains_key(*a) && !self.just_born(a)).map(|a| (n.id.clone(), a.to_owned())))
             .collect::<Vec<_>>();
-        if self.pending_close.is_none()
+        // Every retained missing pane gets an explanation, even while a
+        // different observation is using the one background slot.
+        let waiting=missing.iter().filter(|(_,a)|!self.natural_audit_status.contains_key(a)
+            && !self.closing_terminals.get(a).copied().unwrap_or(false))
+            .map(|(_,a)|a.clone()).collect::<Vec<_>>();
+        for address in waiting {
+            let reason=if self.close_holds.contains(&address) {
+                "The original close outcome is unverified. Retry the original pane/tab/workspace close to reconcile it."
+            } else {
+                "Waiting for verified exit evidence. Close this pane to request cleanup."
+            };
+            self.cleanup_wait_reason(&[address],reason,cx);
+        }
+        if self.pending_close.is_none() && self.observed_audit.is_none() && self.observed_completion.is_none()
             && let Some((_,address))=missing.iter().find(|(_,a)|!self.close_holds.contains(a) && !self.natural_audit_attempted.contains(a)
+                && self.natural_audit_status.get(a).is_none_or(|state|state.ready(Instant::now()))
                 && !self.closing_terminals.get(a).copied().unwrap_or(false)) {
             self.begin_natural_audit(close::Target::Terminal(address.clone()),true,window,cx);
         }
@@ -2324,6 +2342,7 @@ impl AppWindow {
         if let Some(address)=represented
             && !close::may_prune(self.closing_terminals.get(&address).copied().unwrap_or(false),self.close_holds.contains(&address)) {
             if !self.close_holds.contains(&address) {self.begin_natural_audit(close::Target::Terminal(address),true,window,cx);}
+            else {self.cleanup_wait_reason(&[address],"Waiting for the original close receipt. Retry the original close if its outcome is unknown.",cx);}
             return;
         }
         if let Some(pane) = block.strip_suffix(SWAP) {
@@ -2705,6 +2724,15 @@ impl AppWindow {
             return;
         }
         if !close::supported(&self.core.hello) { return self.fail("core does not support guarded close and recovery; no terminal was signalled"); }
+        if let Some(active)=&self.observed_audit
+            && (active.operation_id==plan.operation_id || (!recovering && active.roots==plan.roots)) {
+            self.answer(Ok(json!({"pending":true,"operation":"natural_exit_audit","operation_id":active.operation_id})));
+            return;
+        }
+        if recovering && self.observed_audit.as_ref().is_some_and(|active|active.operation_id!=plan.operation_id
+            && active.expected.iter().any(|i|plan.expected.iter().any(|p|p.address==i.address))) {
+            return self.fail("A separate observed audit owns this scope. Its result is preserved; retry this original operation afterward.");
+        }
         if !recovering && plan.expected.iter().any(|i|self.close_holds.contains(&i.address)) {
             return self.fail("an earlier close must be reconciled using its original target");
         }
@@ -2712,6 +2740,9 @@ impl AppWindow {
             let core_id=self.core.hello["core"]["id"].as_str().unwrap_or_default();
             if let Err(error)=close::save_pending(&file("close-pending"),core_id,&plan) { return self.fail(format!("cannot preserve close evidence: {error}")); }
             self.retained_closes.insert(plan.operation_id.clone(),plan.clone());
+        }
+        if plan.roots.iter().any(|a|self.natural_audit_status.contains_key(a)) {
+            self.cleanup_wait_reason(&plan.roots,"Checking close approval; the pane is preserved until its exact receipt.",cx);
         }
         self.automatic_close_pending=context["mode"]=="automatic";
         self.close_holds.extend(plan.expected.iter().map(|i| i.address.clone()));
@@ -2735,17 +2766,20 @@ impl AppWindow {
             let _ = this.update_in(cx, |this, window, cx| {
                 this.pending_close.take();
                 this.automatic_close_pending=false;
-                if this.draining || generation != this.core_generation { return; }
-                this.complete_close_request(&plan,result,recovering,window,cx);
+                if this.draining || generation != this.core_generation { this.finish_observed_audit(window,cx); return; }
+                this.complete_close_request(&plan,result,recovering,false,window,cx);
 
             });
         }).detach();
     }
 
-    fn complete_close_request(&mut self, plan: &close::Plan, result: Result<close::Resolution,String>, recovering: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn complete_close_request(&mut self, plan: &close::Plan, result: Result<close::Resolution,String>, recovering: bool, observation: bool, window: &mut Window, cx: &mut Context<Self>) {
         let result=match result {
             Ok(close::Resolution::Closed(completed))=>Ok(completed),
             Ok(close::Resolution::Cancelled)=>{
+                if plan.roots.iter().any(|a|self.natural_audit_status.contains_key(a)) {
+                    self.cleanup_wait_reason(&plan.roots,"Approval was cancelled before termination. Complete the required report/review, then close this pane to retry.",cx);
+                }
                 // This proof certifies no signal, not successful termination.
                 // Preserve the entire model, retire the hold, require a new request.
                 if let Err(error)=close::remove_pending(&file("close-pending"),&plan) {
@@ -2753,11 +2787,12 @@ impl AppWindow {
                 } else {
                     self.retained_closes.remove(&plan.operation_id);
                     for identity in &plan.expected { self.close_holds.remove(&identity.address); }
-                    self.layout_notice("Close was cancelled before termination","The layout is unchanged. Retry close when ready.",window,cx);
+                    if !observation {self.layout_notice("Close was cancelled before termination","The layout is unchanged. Retry close when ready.",window,cx);}
                 }
                 for (machines,results) in std::mem::take(&mut self.close_deferred_documents) {
                     self.documents_updated(machines,results,window,cx);
                 }
+                self.finish_observed_audit(window,cx);
                 return;
             }
             Err(error)=>Err(error),
@@ -2777,6 +2812,7 @@ impl AppWindow {
                     .map(|node| node.id.clone()).collect::<Vec<_>>();
                 for block in blocks { self.chrome.remove(&block); }
                 for identity in &plan.expected {
+                    self.natural_audit_status.remove(&identity.address);
                     self.close_holds.remove(&identity.address);
                     self.closing_terminals.insert(identity.address.clone(), true);
                 }
@@ -2784,13 +2820,17 @@ impl AppWindow {
                 self.flush_documents(false, window, cx);
             }
             Err(error) => {
+                if plan.roots.iter().any(|a|self.natural_audit_status.contains_key(a)) {
+                    self.cleanup_wait_reason(&plan.roots,&error,cx);
+                }
                 // Keep holds: timeout/partial termination is never permission to prune.
-                self.layout_notice("Session close refused", &error, window, cx);
+                if !observation {self.layout_notice("Session close refused", &error, window, cx);}
             }
         }
         for (machines,results) in std::mem::take(&mut self.close_deferred_documents) {
             self.documents_updated(machines,results,window,cx);
         }
+        self.finish_observed_audit(window,cx);
 
     }
 
@@ -2805,6 +2845,8 @@ impl AppWindow {
         let mut persisted=Model::default();document.replace(&mut persisted,None);
         let ready=self.retained_closes.values().filter(|plan|
             self.pending_close.as_ref().is_none_or(|p|p.operation_id!=plan.operation_id)
+            && self.observed_audit.as_ref().is_none_or(|p|p.operation_id!=plan.operation_id)
+            && self.observed_completion.as_ref().is_none_or(|(p,_,_)|p.operation_id!=plan.operation_id)
             && plan.cleanup_ready(&self.model,&persisted)
             && !self.chrome.terminals().iter().chain(self.file_chrome.terminals().iter())
                 .any(|n|n.terminal().is_some_and(|a|plan.expected.iter().any(|i|i.address==a))))
@@ -2842,58 +2884,181 @@ impl AppWindow {
         self.cleanup_close_evidence();Ok(())
     }
 
+    fn cleanup_wait_reason(&mut self, roots: &[String], reason: &str, cx: &mut Context<Self>) {
+        let mut changed=false;
+        for address in roots {
+            let state=self.natural_audit_status.entry(address.clone()).or_default();
+            if state.reason!=reason {state.waiting(reason);changed=true;}
+        }
+        if changed {cx.notify();}
+    }
+
+    fn finish_observed_audit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_close.is_some() || self.draining {return}
+        let Some((plan,result,generation))=self.observed_completion.take() else {return};
+        if self.retained_closes.values().any(|other|other.operation_id!=plan.operation_id && !other.ui_applied
+            && other.expected.iter().any(|i|plan.expected.iter().any(|p|p.address==i.address))) {
+            self.cleanup_wait_reason(&plan.roots,"Another original operation owns this scope. Reconcile it before cleanup.",cx);
+            self.observed_completion=Some((plan,result,generation));
+            return;
+        }
+        if generation!=self.core_generation {
+            self.cleanup_wait_reason(&plan.roots,"The core reconnected. Close this pane to revalidate its original operation.",cx);
+            return;
+        }
+        self.complete_close_request(&plan,result,true,true,window,cx);
+    }
+
+    fn cleanup_wait_banner(&self, address: &str) -> Option<AnyElement> {
+        self.natural_audit_status.get(address).map(|state|
+            div().flex_none().w_full().px_2().py_1()
+                .bg(c("background")).text_color(c("foreground"))
+                .text_size(settings::z(11.)).child(state.message()).into_any_element())
+    }
+
     /// An existing exit/missing-pane event requests a signal-free audit. It
     /// never restores blanket prune permission and never starts a new kill.
     fn begin_natural_audit(&mut self, target: close::Target, observation: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.pending_close.is_some() || self.draining || !self.changing_terminals.is_empty() { return; }
-        let draft=match close::Plan::audit_draft(target,&self.model) {
+        if self.draining {return}
+        let mut draft=match close::Plan::audit_draft(target,&self.model) {
             Ok(plan)=>plan,
-            Err(error)=>{ if !observation {self.fail(error);} return; }
+            Err(error)=>{if !observation {self.fail(error);} return;}
         };
-        if let Some(plan)=self.retained_closes.values().find(|p|p.ui_applied && p.expected.iter().any(|i|draft.roots.contains(&i.address))).cloned() {
-            return self.begin_close_request(plan.target.clone(),Value::Null,Some(plan),window,cx);
+        if !self.changing_terminals.is_empty() {
+            self.cleanup_wait_reason(&draft.roots,"Waiting for the current terminal layout update; this pane is preserved.",cx);
+            return;
         }
-        if draft.roots.iter().any(|a|self.close_holds.contains(a)) { if !observation {self.fail("reconcile the original held operation first");} return; }
-        if observation && draft.roots.iter().any(|a|self.natural_audit_attempted.contains(a)
-            || self.natural_snapshot_checked.get(a).is_some_and(|at|at.elapsed()<Duration::from_secs(30))) { return; }
-        if let Some(error)=&self.close_evidence_error { if !observation {self.fail(format!("retained close evidence requires recovery: {error}"));} return; }
-        if !close::supported(&self.core.hello) || !self.core.hello["methods"].as_array().is_some_and(|m|m.iter().any(|v|v=="terminal.close_snapshot")) {
-            if !observation {self.fail("core lacks guarded natural-exit audit support");} return;
+        if let Some(active)=&self.observed_audit {
+            if observation {
+                let waiting=draft.roots.iter().filter(|a|!self.natural_audit_status.contains_key(*a)).cloned().collect::<Vec<_>>();
+                self.cleanup_wait_reason(&waiting,"Another cleanup check is running. Retry this pane's close when ready.",cx);
+                return;
+            }
+            if draft.roots==active.roots {
+                self.answer(Ok(json!({"pending":true,"operation":"natural_exit_audit","operation_id":active.operation_id})));
+                return;
+            }
+            if draft.roots.iter().any(|a|active.roots.contains(a)) {
+                return self.fail("This scope overlaps an existing cleanup audit. Close its original pane to join it.");
+            }
+        }
+        if self.pending_close.is_some() {
+            self.cleanup_wait_reason(&draft.roots,"Waiting for your current close to finish; this pane is preserved.",cx);
+            if !observation {self.fail("another guarded close is pending");}
+            return;
+        }
+        if !observation {
+            if let Some(plan)=self.retained_closes.values().find(|p|p.roots==draft.roots).cloned() {
+                return self.begin_close_request(plan.target.clone(),Value::Null,Some(plan),window,cx);
+            }
+        } else if let Some(plan)=self.retained_closes.values().find(|p|p.ui_applied && p.roots==draft.roots).cloned() {
+            draft=plan;
+        }
+        if draft.roots.iter().any(|a|self.close_holds.contains(a)) {
+            self.cleanup_wait_reason(&draft.roots,"An uncertain original operation is preserved. Close this pane to reconcile it.",cx);
+            if !observation {self.fail("reconcile the original held operation first");}
+            return;
+        }
+        if observation {
+            if self.observed_completion.is_some() {
+                let waiting=draft.roots.iter().filter(|a|!self.natural_audit_status.contains_key(*a)).cloned().collect::<Vec<_>>();
+                self.cleanup_wait_reason(&waiting,"Waiting for another cleanup receipt. Close this pane to request verification.",cx);
+                return;
+            }
+            if draft.roots.iter().any(|a|self.natural_audit_attempted.contains(a)
+                || self.natural_audit_status.get(a).is_some_and(|state|!state.ready(Instant::now()))) {return}
+            for address in &draft.roots {self.natural_audit_status.entry(address.clone()).or_default().start(Instant::now());}
+        }
+        let unavailable=if let Some(error)=&self.close_evidence_error {
+            Some(format!("Retained close evidence requires repair: {error}"))
+        } else if !close::supported(&self.core.hello) || !self.core.hello["methods"].as_array().is_some_and(|m|m.iter().any(|v|v=="terminal.close_snapshot")) {
+            Some("The core does not support verified natural-exit cleanup. The pane is preserved.".into())
+        } else {None};
+        if let Some(error)=unavailable {
+            self.cleanup_wait_reason(&draft.roots,&error,cx);
+            if !observation {self.fail(error);} return;
         }
         let core_id=self.core.hello["core"]["id"].as_str().unwrap_or_default().to_owned();
-        if core_id.is_empty() { if !observation {self.fail("missing native core identity");} return; }
-        for address in &draft.roots { self.natural_snapshot_checked.insert(address.clone(),Instant::now()); }
-        self.pending_close=Some(draft.clone());
-        if !observation { self.answer(Ok(json!({"pending":true,"operation":"natural_exit_audit","operation_id":draft.operation_id}))); }
+        if core_id.is_empty() {
+            self.cleanup_wait_reason(&draft.roots,"The core identity is unavailable. The pane is preserved.",cx);
+            if !observation {self.fail("missing native core identity");} return;
+        }
+        if observation {self.observed_audit=Some(draft.clone());}
+        else {
+            self.pending_close=Some(draft.clone());
+            self.answer(Ok(json!({"pending":true,"operation":"natural_exit_audit","operation_id":draft.operation_id})));
+        }
+        self.cleanup_wait_reason(&draft.roots,"Checking native exit and audit evidence.",cx);
         let core=self.core.clone();let generation=self.core_generation;
         cx.spawn_in(window,async move |this,cx| {
-            let core_id_check=core_id.clone();
-            let (plan,result)=cx.background_executor().spawn(async move {
-                let prepared=(|| {
-                    let snapshot=core.call_timeout("terminal.close_snapshot",json!({"roots":draft.roots}),Duration::from_secs(15)).map_err(|e|format!("{e:#}"))?;
-                    let plan=draft.audit_snapshot(&core_id,snapshot)?;
-                    close::save_pending(&file("close-pending"),&core_id,&plan)?;
-                    Ok::<_,String>(plan)
-                })();
-                let plan=match prepared {Ok(plan)=>plan,Err(error)=>return (None,Err(error))};
-                let result=plan.reconcile_guarded(|params|core.call_timeout("terminal.close_reconcile",params,Duration::from_secs(300))
-                    .map_err(|error|close::CallFailure {kind:crate::hc::error_kind(&error).map(str::to_owned),message:format!("{error:#}")}));
-                (Some(plan),result)
+            let original=draft.clone();let lookup=core.clone();let lookup_id=core_id.clone();
+            let prepared=cx.background_executor().spawn(async move {
+                if !draft.expected.is_empty() {return Ok(draft);}
+                let snapshot=lookup.call_timeout("terminal.close_snapshot",json!({"roots":draft.roots}),Duration::from_secs(15))
+                    .map_err(|e|format!("{e:#}"))?;
+                draft.audit_snapshot(&lookup_id,snapshot)
+            }).await;
+            let plan=this.update_in(cx,|this,window,cx| {
+                let clear_slot=|this:&mut Self| {
+                    if observation {
+                        if this.observed_audit.as_ref().is_some_and(|p|p.operation_id==original.operation_id) {this.observed_audit=None;}
+                    } else if this.pending_close.as_ref().is_some_and(|p|p.operation_id==original.operation_id) {this.pending_close=None;}
+                };
+                if this.draining || generation!=this.core_generation || this.core.hello["core"]["id"].as_str()!=Some(core_id.as_str()) {
+                    clear_slot(this);return None;
+                }
+                let plan=match prepared {
+                    Ok(plan)=>plan,
+                    Err(error)=>{
+                        clear_slot(this);
+                        this.cleanup_wait_reason(&original.roots,&error,cx);
+                        if !observation {this.layout_notice("Natural-exit cleanup waiting",&error,window,cx);}
+                        return None;
+                    }
+                };
+                if observation && this.pending_close.is_some() {
+                    clear_slot(this);
+                    this.cleanup_wait_reason(&plan.roots,"Waiting for your current close to finish; this pane is preserved.",cx);
+                    return None;
+                }
+                if plan.expected.iter().any(|i|this.close_holds.contains(&i.address)) {
+                    clear_slot(this);
+                    this.cleanup_wait_reason(&plan.roots,"An uncertain original operation already owns this scope. Close the original pane to reconcile it.",cx);
+                    return None;
+                }
+                if original.expected.is_empty()
+                    && let Err(error)=close::save_pending(&file("close-pending"),&core_id,&plan) {
+                    clear_slot(this);this.cleanup_wait_reason(&plan.roots,&error,cx);return None;
+                }
+                this.natural_audit_attempted.extend(plan.roots.iter().cloned());
+                this.close_holds.extend(plan.expected.iter().map(|i|i.address.clone()));
+                this.retained_closes.insert(plan.operation_id.clone(),plan.clone());
+                if observation {this.observed_audit=Some(plan.clone());}
+                else {this.pending_close=Some(plan.clone());}
+                Some(plan)
+            }).ok().flatten();
+            let Some(plan)=plan else {return};
+            let work=plan.clone();
+            let result=cx.background_executor().spawn(async move {
+                work.reconcile_guarded(|params|core.call_timeout("terminal.close_reconcile",params,Duration::from_secs(300))
+                    .map_err(|error|close::CallFailure{kind:crate::hc::error_kind(&error).map(str::to_owned),message:format!("{error:#}")}))
             }).await;
             let _=this.update_in(cx,|this,window,cx| {
-                this.pending_close.take();
-                if this.core.hello["core"]["id"].as_str()!=Some(core_id_check.as_str()) { return; }
-                if let Some(plan)=plan {
-                    this.natural_audit_attempted.extend(plan.roots.iter().cloned());
-                    this.close_holds.extend(plan.expected.iter().map(|i|i.address.clone()));
-                    this.retained_closes.insert(plan.operation_id.clone(),plan.clone());
-                    if this.draining || generation!=this.core_generation { return; }
-                    this.complete_close_request(&plan,result,true,window,cx);
-                } else if let Err(error)=result {
-                    // Only read-only snapshot/preparation ran; no core operation
-                    // was submitted and no hold or cleanup is justified.
-                    if !observation {this.layout_notice("Natural-exit audit unavailable",&error,window,cx);}
-                    else {tracing::debug!("natural-exit audit retained pane: {error}");}
+                if observation {
+                    if this.observed_audit.as_ref().is_some_and(|p|p.operation_id==plan.operation_id) {this.observed_audit=None;}
+                } else if this.pending_close.as_ref().is_some_and(|p|p.operation_id==plan.operation_id) {this.pending_close=None;}
+                if this.core.hello["core"]["id"].as_str()!=Some(core_id.as_str()) {return}
+                let reason=match &result {
+                    Ok(close::Resolution::Closed(_))=>"Cleanup verified; waiting for the current close to finish.".to_owned(),
+                    Ok(close::Resolution::Cancelled)=>"Audit approval is not ready. Complete the required report/review, then close this pane to retry.".to_owned(),
+                    Err(error)=>format!("Audit could not complete: {error}. The original operation is preserved."),
+                };
+                this.cleanup_wait_reason(&plan.roots,&reason,cx);
+                if observation {
+                    this.observed_completion=Some((plan,result,generation));
+                    this.finish_observed_audit(window,cx);
+                } else if !this.draining && generation==this.core_generation {
+                    this.complete_close_request(&plan,result,true,false,window,cx);
                 }
             });
         }).detach();
@@ -4270,11 +4435,11 @@ impl AppWindow {
 
     fn render_block(&self, n: &Node, content: &Content, focused: &HashSet<String>, cx: &mut Context<Self>) -> AnyElement {
         match content {
-            Content::Terminal { .. } => match self.pane_term(&n.id) {
+            Content::Terminal { terminal: address } => match self.pane_term(&n.id) {
                 Some(t) => {
                     let id = n.id.clone();
                     div()
-                        .size_full()
+                        .size_full().flex().flex_col()
                         .on_any_mouse_down(cx.listener(move |this, _, _, cx| {
                             if this.automatic_close_pending { cx.stop_propagation(); return; }
                             // Overlay terminals keep their own focus; chrome blocks share the pane focus API.
@@ -4289,10 +4454,11 @@ impl AppWindow {
                                 cx.notify();
                             }
                         }))
-                        .child(shown_terminal(&t.view, cx))
+                        .children(self.cleanup_wait_banner(address))
+                        .child(div().flex_1().min_h_0().child(shown_terminal(&t.view, cx)))
                         .into_any_element()
                 }
-                None => div().into_any_element(),
+                None => div().size_full().flex().flex_col().children(self.cleanup_wait_banner(address)).into_any_element(),
             },
             Content::Mod { .. } => self.render_slot(&n.id, cx),
             Content::Agent { .. } => match self.shown_agent() {
@@ -5577,6 +5743,105 @@ mod tests {
             assert!(reply["error"].as_str().is_some_and(|e|e.contains("held")));
             assert_eq!(snapshot(&this.model),after_focus);
             this.pending_close=None;
+        }));
+    }
+
+    #[test]
+    fn observed_audit_reports_failure_without_locking_manual_commands() {
+        in_own_process("observed_audit_slot");
+    }
+
+    #[gpui::test]
+    fn observed_audit_slot(cx: &mut gpui::TestAppContext) {
+        use serde_json::json;
+        use super::close;
+        if !running_alone("observed_audit_slot") {return}
+        let (view,cx)=open_window(cx,"unused","",json!({"id":"main","type":"block","content":{"tab":"active"}}));
+        cx.update(|window,cx|view.update(cx,|this,cx| {
+            let mut core=crate::hc::offline();
+            std::sync::Arc::get_mut(&mut core).unwrap().hello=json!({"core":{"id":"cleanup-fixture"}});
+            this.core=core;
+            this.model.add_space("s1","","",crate::model::Tab::new("tb1","","p1","t1"));
+            this.model.split("p1",crate::layout::Axis::Row,"p2","t2");
+            this.model.add_tab("s1",crate::model::Tab::new("tb2","","p3","t3"));
+            this.model.focus_pane("p2");
+            this.live=[("t2",2),("t3",3)].into_iter().map(|(address,pid)|
+                (address.into(),json!({"address":address,"pid":pid,"created_ms":100+pid,"labels":{}}))).collect();
+            this.documents.get_mut("").unwrap().available=true;
+            // The offline core refuses before any operation starts, but the
+            // reason is visible in the pane and repeated polls are backed off.
+            this.begin_natural_audit(close::Target::Terminal("t1".into()),true,window,cx);
+            assert!(this.pending_close.is_none());
+            assert!(this.observed_audit.is_none());
+            assert!(this.cleanup_wait_banner("t1").is_some());
+            let state=this.natural_audit_status.get("t1").unwrap();
+            assert!(state.message().contains("core does not support"));
+            let retry_check=std::time::Instant::now();
+            assert!(!state.ready(retry_check+std::time::Duration::from_secs(29)));
+            assert!(state.ready(retry_check+std::time::Duration::from_secs(31)));
+            this.begin_natural_audit(close::Target::Terminal("t1".into()),true,window,cx);
+            assert!(this.natural_audit_status["t1"].ready(retry_check+std::time::Duration::from_secs(31)));
+
+            let observed=close::Plan::audit_draft(close::Target::Terminal("t1".into()),&this.model).unwrap();
+            let observed_id=observed.operation_id.clone();
+            this.observed_audit=Some(observed.clone());
+            this.close_holds.insert("t1".into());
+            let reply=this.run_as("tab.move",json!({"id":"tb2","index":1}),false,window,cx);
+            assert!(reply.get("error").is_none(),"{reply}");
+            let reply=this.run_as("pane.focus",json!({"pane":"p3"}),false,window,cx);
+            assert!(reply.get("error").is_none(),"{reply}");
+            let split=this.run_as("pane.split",json!({"pane":"p3","direction":"right","mod":"unused"}),false,window,cx);
+            assert!(split.get("error").is_none(),"{split}");
+            let added=split["pane"].as_str().unwrap().to_owned();
+            let closed=this.run_as("pane.close",json!({"pane":added}),false,window,cx);
+            assert!(closed.get("error").is_none(),"{closed}");
+            assert!(this.model.tab_of(&added).is_none(),"an unrelated mod-only close completes immediately");
+            // The offline fixture deliberately refuses native kills. The real
+            // terminal path must still reach that compatibility gate, rather
+            // than being refused by the observed-audit foreground slot.
+            let terminal=this.run_as("terminal.kill",json!({"terminal":"t3"}),false,window,cx);
+            assert!(terminal["error"].as_str().is_some_and(|e|e.contains("core does not support")),"{terminal}");
+            let reply=this.run_as("pane.close",json!({"pane":"p1"}),false,window,cx);
+            assert_eq!(reply["operation_id"],observed_id,"same-pane close must join, not create a second operation");
+            assert_eq!(reply["pending"],true);
+            assert!(this.pending_close.is_none(),"an observation must not take the person's structural lock");
+            assert_eq!(this.model.address_of("p1").as_deref(),Some("t1"));
+
+            // A late observed result cannot clear a person's newer pending
+            // operation or mutate its model while that transaction is pending.
+            let human=close::Plan::capture(close::Target::Pane("p3".into()),&this.model,&this.live).unwrap();
+            let human_id=human.operation_id.clone();
+            this.pending_close=Some(human);
+            this.observed_audit=None;
+            this.close_holds.insert("t1".into());
+            this.observed_completion=Some((observed,Err("helper audit denied; original operation preserved".into()),this.core_generation));
+            this.finish_observed_audit(window,cx);
+            assert_eq!(this.pending_close.as_ref().unwrap().operation_id,human_id);
+            assert!(this.observed_completion.is_some());
+            assert_eq!(this.model.address_of("p1").as_deref(),Some("t1"));
+            this.pending_close=None;
+            this.finish_observed_audit(window,cx);
+            assert!(this.close_holds.contains("t1"),"unknown audit must retain its hold");
+            assert_eq!(this.model.address_of("p1").as_deref(),Some("t1"));
+            assert!(this.cleanup_wait_banner("t1").is_some());
+            // A retry replaces the refusal with a progress reason, and only
+            // an exact audited receipt removes that reason and the old pane.
+            this.cleanup_wait_reason(&["t1".into()],"Checking cleanup evidence.",cx);
+            assert!(this.natural_audit_status["t1"].message().contains("Checking"));
+            let mut draft=close::Plan::audit_draft(close::Target::Terminal("t1".into()),&this.model).unwrap();
+            draft.operation_id=observed_id;
+            let verified=draft.audit_snapshot("cleanup-fixture",json!({
+                "core_id":"cleanup-fixture","roots":["t1"],
+                "expected":[{"address":"t1","pid":1,"created_ms":101}],"operations":[],
+                "targets":[{"address":"t1","pid":1,"created_ms":101,"input_generation":7,
+                    "program_started_ms":100,"turn":2,"native_state":"finished","observed_exit":true}]
+            })).unwrap();
+            close::save_pending(&super::file("close-pending"),"cleanup-fixture",&verified).unwrap();
+            let receipt=verified.completed(verified.expected.clone()).unwrap();
+            this.complete_close_request(&verified,Ok(close::Resolution::Closed(receipt)),true,true,window,cx);
+            assert!(this.cleanup_wait_banner("t1").is_none());
+            assert!(this.model.pane_of("t1").is_none());
+            assert!(this.model.pane_of("t2").is_some());
         }));
     }
 

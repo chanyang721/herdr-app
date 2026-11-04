@@ -1044,10 +1044,16 @@ including a small herdr-core skill you can install with the user's permission.
 The local close-guard app requires the matching reviewed core/helper first:
 terminal.kill_batch, terminal.close_reconcile, and terminal.close_snapshot.
 A core version alone does not establish compatibility. Install the app last after
-isolated validation and review. The automatic idle closer leaves the last session
-of the last workspace for a person to close manually.
+isolated validation and review. The automatic idle closer leaves each workspace's last
+session for a person to close manually.
 
 If retained close evidence is corrupt, the error names the exact file. Preserve
 it and restore that same operation file from a verified backup. Do not delete it
 or guess identities. Run app.close_evidence_reload after repair; this reload
 never closes a session or releases an uncertain hold by itself.
+
+An exited pane that cannot yet be audited shows a Cleanup pending reason. Its
+read-only automatic checks are bounded (30s, then 120s; three attempts total).
+Close that pane explicitly to retry or join its current audit. Observed cleanup
+does not hold the person's structural-command slot; unknown operation evidence
+is still preserved.

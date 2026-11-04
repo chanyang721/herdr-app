@@ -387,6 +387,40 @@ pub(super) fn remove_pending(dir: &std::path::Path, plan: &Plan) -> Result<(), S
     std::fs::remove_file(dir.join(format!("{}.json",plan.operation_id))).map_err(|e|e.to_string())
 }
 
+/// Existing exit observations get a small, bounded retry budget. Human requests
+/// bypass this schedule, but still need the original exact native proof.
+#[derive(Clone, Debug, Default)]
+pub(super) struct AuditRetry {
+    pub reason: String,
+    attempts: u8,
+    next: Option<std::time::Instant>,
+}
+
+impl AuditRetry {
+    pub fn ready(&self, now: std::time::Instant) -> bool {
+        self.attempts < 3 && self.next.is_none_or(|at|now>=at)
+    }
+    pub fn start(&mut self, now: std::time::Instant) -> bool {
+        if !self.ready(now) {return false}
+        self.attempts+=1;
+        self.next=match self.attempts {
+            1=>Some(now+std::time::Duration::from_secs(30)),
+            2=>Some(now+std::time::Duration::from_secs(120)),
+            _=>None,
+        };
+        self.reason="Checking cleanup evidence.".into();
+        true
+    }
+    pub fn waiting(&mut self, reason: &str) {
+        self.reason=reason.chars().take(480).collect();
+    }
+    pub fn message(&self) -> String {
+        let suffix=if self.attempts>=3 {" Automatic retries paused; retry the original pane/tab/workspace close."}
+            else {" Retry the original pane/tab/workspace close when ready."};
+        format!("Cleanup pending: {}{suffix}",self.reason)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -733,6 +767,23 @@ mod tests {
         assert!(marked.cleanup_ready(&current,&empty));
         assert!(!plan.cleanup_ready(&current,&empty),"uncertain operations are never garbage-collected");
         remove_pending(&dir,&marked).unwrap();std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn observed_snapshot_retries_are_bounded_and_show_actionable_reasons() {
+        use std::time::{Duration,Instant};
+        let start=Instant::now();let mut state=AuditRetry::default();
+        assert!(state.start(start));
+        state.waiting("Actual Exit witness is not recorded yet.");
+        assert!(state.message().contains("Actual Exit witness"));
+        assert!(state.message().contains("original pane/tab/workspace close"));
+        assert!(!state.start(start+Duration::from_secs(29)));
+        assert!(state.start(start+Duration::from_secs(30)));
+        assert!(!state.start(start+Duration::from_secs(149)));
+        assert!(state.start(start+Duration::from_secs(150)));
+        state.waiting("Binding is still unavailable.");
+        assert!(state.message().contains("Automatic retries paused"));
+        assert!(!state.ready(start+Duration::from_secs(86400)));
     }
 
     #[test]
