@@ -569,13 +569,73 @@ pub struct Snapshot {
     pub floats: Value,
     /// { platform, titlebar, buttons, maximized, fullscreen, active }.
     pub window: Value,
+    /// The last `MESSAGE_EVENTS` sends heard since the app started, oldest first
+    /// (see `append_message_events`). In memory only.
+    pub message_events: Value,
 }
 
 impl Default for Snapshot {
     /// Lists start empty, never null, so mods can map over them right away.
     fn default() -> Self {
-        Snapshot { layout: Value::Null, spaces: json!([]), machines: json!([]), agents: json!([]), panes: json!([]), terminals: json!([]), focused: Value::Null, floats: json!({}), window: Value::Null }
+        Snapshot { layout: Value::Null, spaces: json!([]), machines: json!([]), agents: json!([]), panes: json!([]), terminals: json!([]), focused: Value::Null, floats: json!({}), window: Value::Null, message_events: json!([]) }
     }
+}
+
+/// How many sends `messageEvents()` keeps.
+pub const MESSAGE_EVENTS: usize = 1024;
+
+thread_local! {
+    /// The app's own count of kept sends (it outlives core restarts), and the
+    /// last core event taken: (connection generation, core seq).
+    static MESSAGE_SEQ: std::cell::Cell<(u64, Option<(u64, u64)>)> = const { std::cell::Cell::new((0, None)) };
+}
+
+/// Adds the core's `message_sent` events (as `EventLines::take_messages` gives
+/// them) heard on connection `generation`. Keeps only who, to whom, when and
+/// whether a turn started: never text. An event at or below the last core seq
+/// of the same generation is a repeat and is skipped; a new generation (the
+/// core reconnected) keeps what is already there. Returns whether any was added.
+pub fn append_message_events(generation: u64, events: Vec<Value>) -> bool {
+    let mut added = Vec::new();
+    let (mut seq, mut last) = MESSAGE_SEQ.get();
+    for e in events {
+        let Some(core_seq) = e["seq"].as_u64() else { continue };
+        if last.is_some_and(|(g, s)| g == generation && core_seq <= s) {
+            continue;
+        }
+        let Some(target) = e["target"].as_str().or_else(|| e["terminal"].as_str()) else { continue };
+        let source = e["source"].as_str();
+        // The core's number as it came (epoch ms); the time it was heard if missing.
+        let at = Some(&e["at"]).filter(|at| at.is_number()).cloned().unwrap_or_else(|| {
+            json!(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64))
+        });
+        last = Some((generation, core_seq));
+        seq += 1;
+        added.push(json!({
+            "id": format!("{generation}:{core_seq}"),
+            "seq": seq,
+            "source": source.unwrap_or("external"),
+            "external": source.is_none(),
+            "target": target,
+            "at": at,
+            "started": e["started"].as_bool(),
+        }));
+    }
+    MESSAGE_SEQ.set((seq, last));
+    if added.is_empty() {
+        return false;
+    }
+    SNAPSHOT.with_borrow_mut(|s| {
+        if !s.message_events.is_array() {
+            s.message_events = json!([]);
+        }
+        let list = s.message_events.as_array_mut().expect("an array");
+        list.extend(added);
+        let over = list.len().saturating_sub(MESSAGE_EVENTS);
+        list.drain(..over);
+    });
+    REVISIONS.with_borrow_mut(|r| *r.entry("message_events").or_default() += 1);
+    true
 }
 
 /// Replaces one part of the snapshot; returns whether it changed.
@@ -1012,6 +1072,7 @@ fn module(inst: Instance, copy: u64) -> HostModule {
         .function("machines", reader(reads.clone(), "machines", |s| &s.machines))
         .function("agents", reader(reads.clone(), "agents", |s| &s.agents))
         .function("panes", reader(reads.clone(), "panes", |s| &s.panes))
+        .function("messageEvents", reader(reads.clone(), "message_events", |s| &s.message_events))
         .function("setAgentOrder", |a| {
             AGENT_ORDER.with(|s| *s.borrow_mut() = strings(a.get(0)));
             Ok(HostValue::Null)
@@ -1213,6 +1274,43 @@ mod tests {
             assert!(!snapshot_changed(1));
             drop(reads);
             assert!(!snapshot_changed(1));
+        }).join().unwrap();
+    }
+
+    #[test]
+    fn sends_are_a_bounded_list_that_survives_reconnects_without_repeats() {
+        std::thread::spawn(|| {
+            let sent = |seq: u64, source: Value, target: &str, started: Value| {
+                json!({"seq": seq, "terminal": target, "source": source, "target": target, "at": 1000 + seq, "started": started})
+            };
+            let list = || SNAPSHOT.with_borrow(|s| s.message_events.as_array().unwrap().clone());
+            let reads = Rc::new(RefCell::new(LiveReads::default()));
+            LIVE_READS.with_borrow_mut(|copies| { copies.insert(1, Rc::downgrade(&reads)); });
+            read(&reads, "message_events", |s| &s.message_events);
+            // Others' readers aren't woken by a send, nor this one by a status.
+            assert!(publish_agents(json!([{"address":"t1","status":"working"}])));
+            assert!(!snapshot_changed(1));
+            assert!(!append_message_events(0, vec![]));
+
+            assert!(append_message_events(0, vec![sent(4, json!("t3"), "rohan/t7", json!(true)), sent(5, Value::Null, "t1", Value::Null)]));
+            assert!(snapshot_changed(1));
+            assert_eq!(list(), [
+                json!({"id": "0:4", "seq": 1, "source": "t3", "external": false, "target": "rohan/t7", "at": 1004, "started": true}),
+                json!({"id": "0:5", "seq": 2, "source": "external", "external": true, "target": "t1", "at": 1005, "started": null}),
+            ]);
+            // The same connection again: nothing new.
+            assert!(!append_message_events(0, vec![sent(5, Value::Null, "t1", Value::Null), sent(3, json!("t3"), "t1", json!(false))]));
+            assert!(!snapshot_changed(1));
+            // A reconnected core counts from 1 again: kept, added after.
+            assert!(append_message_events(1, vec![sent(1, json!("t2"), "t1", json!(false))]));
+            let now = list();
+            assert_eq!((now.len(), &now[2]["id"], &now[2]["seq"], &now[2]["started"]), (3, &json!("1:1"), &json!(3), &json!(false)));
+            // Bounded: the oldest go first.
+            let many: Vec<Value> = (2..2 + MESSAGE_EVENTS as u64).map(|s| sent(s, json!("t2"), "t1", Value::Null)).collect();
+            assert!(append_message_events(1, many));
+            let now = list();
+            assert_eq!(now.len(), MESSAGE_EVENTS);
+            assert_eq!((&now[0]["id"], &now[MESSAGE_EVENTS - 1]["seq"]), (&json!("1:2"), &json!(3 + MESSAGE_EVENTS as u64)));
         }).join().unwrap();
     }
 

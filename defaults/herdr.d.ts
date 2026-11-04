@@ -212,6 +212,32 @@ export interface PaneInfo {
  *  `panes().find((p) => p.pane === props().pane)`. Live. */
 export function panes(): PaneInfo[];
 
+/** One send (`hc send`, terminal.send) the core reported. It records that text was
+ *  typed into `target`, never the text itself. */
+export interface MessageEvent {
+  /** Unique while the app runs: the core connection and the core's event seq. */
+  id: string;
+  /** Counts up from 1 in the order the app heard sends; keeps counting across core restarts. */
+  seq: number;
+  /** The sending terminal's address as seen from here (e.g. "t3", "rohan/t7"),
+   *  or "external" when the sender was not a terminal (then `external` is true). */
+  source: string;
+  external: boolean;
+  /** The terminal it was typed into, as seen from here ("rohan/t7" for another machine's). */
+  target: string;
+  /** When the core sent it, ms since the epoch. */
+  at: number;
+  /** Whether the target went `working` soon after (as `hc send` says: true "it started
+   *  working", false "it did not start working", null "it doesn't report status").
+   *  The event itself only means the text was typed in. */
+  started: boolean | null;
+}
+
+/** The last 1024 sends heard since the app started, oldest first. In memory only:
+ *  empty after the app restarts, kept (never replayed) when the core reconnects.
+ *  A send changes no terminal: status still comes from `agents()` and `terminals()`. Live. */
+export function messageEvents(): MessageEvent[];
+
 /** Sets agent.next / agent.prev order to match the list a mod displays.
  *  Call when rendering the list. In memory only; missing agents are ignored, new agents
  *  are appended in model order. Without a supplied order, navigation uses model order. */

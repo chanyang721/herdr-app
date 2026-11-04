@@ -696,8 +696,13 @@ impl AppWindow {
                 subscription = sub;
                 event_lines = lines;
                 let (seen, resynced) = event_lines.take_seen();
+                let messages = event_lines.take_messages();
                 if this.update_in(cx, |this, window, cx| {
                     if generation != this.core_generation { return; }
+                    // Sends are their own list; they change no terminal.
+                    if mods::append_message_events(generation, messages) {
+                        this.refresh_snapshot_mods(cx);
+                    }
                     // Our seen writes the core has applied (or, after a fresh
                     // snapshot, can't tell): its labels decide again.
                     if resynced {
