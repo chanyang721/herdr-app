@@ -427,6 +427,7 @@ pub struct AppWindow {
     retained_closes: BTreeMap<String, close::Plan>,
     close_evidence_error: Option<String>,
     automatic_close_pending: bool,
+    close_deferred_documents: Vec<(Option<Value>, Vec<(String, crate::mirror_sync::Outcome)>)>,
     pending_terminals: std::collections::BTreeMap<String, PendingTerminalChange>,
     /// Each machine owns a document; the empty key is this core.
     documents: std::collections::BTreeMap<String, crate::mirror_sync::Slot>,
@@ -526,6 +527,7 @@ impl AppWindow {
             retained_closes,
             close_evidence_error,
             automatic_close_pending: false,
+            close_deferred_documents: Vec::new(),
             pending_terminals: Default::default(),
             documents: {
                 let mut local = crate::mirror_sync::Slot::default();
@@ -813,6 +815,7 @@ impl AppWindow {
     fn reconnected(&mut self, core: Arc<Core>, cx: &mut Context<Self>) {
         tracing::info!("reconnected to the core");
         self.core_generation += 1;
+        self.close_deferred_documents.clear();
         self.documents_watching = false;
         for (machine, slot) in &mut self.documents {
             slot.available = false;
@@ -1911,6 +1914,10 @@ impl AppWindow {
     }
 
     fn documents_updated(&mut self, machines: Option<Value>, results: Vec<(String, crate::mirror_sync::Outcome)>, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.automatic_close_pending {
+            self.close_deferred_documents.push((machines,results));
+            return false;
+        }
         use crate::mirror_sync::Outcome;
         let mut changed = false;
         // The listing every 500 ms brings the machines alone: redraw only when
@@ -2722,6 +2729,10 @@ impl AppWindow {
                         this.layout_notice("Session close refused", &error, window, cx);
                     }
                 }
+                for (machines,results) in std::mem::take(&mut this.close_deferred_documents) {
+                    this.documents_updated(machines,results,window,cx);
+                }
+
             });
         }).detach();
     }
