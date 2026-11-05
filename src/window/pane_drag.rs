@@ -6,6 +6,8 @@ pub(super) struct PaneDrag {
     pane: String,
     tab: String,
     down: Point<Pixels>,
+    /// Pressed on the grip, which owns the click; a header press leaves an unmoved click to the header.
+    grip: bool,
     moving: bool,
     target: Option<(String, Option<Edge>)>,
 }
@@ -36,7 +38,7 @@ fn inherited_movable(root: &Node, id: &str) -> Option<bool> {
 
 impl AppWindow {
     pub(super) fn pane_movable(&self, pane: &str) -> bool {
-        let Some(tab) = self.model.active_tab() else { return false };
+        let Some(tab) = self.model.tab_of(pane) else { return false };
         if tab.zoomed.is_some() || tab.root.panes().len() < 2 || !tab.root.find(pane).is_some_and(Node::is_pane) {
             return false;
         }
@@ -44,6 +46,12 @@ impl AppWindow {
         inherited_movable(&tab.root, pane)
             .or_else(|| owner.and_then(|n| inherited_movable(&self.chrome, &n.id)))
             .unwrap_or(true)
+    }
+
+    /// A move is a layout write: like `pane.move` and resizing, it needs the
+    /// pane's machine document, checked when the drag starts and again at the drop.
+    fn pane_layout_writable(&self, pane: &str) -> bool {
+        self.model.space_of(pane).is_some_and(|s| self.require_document(s.machine.as_deref()).is_ok())
     }
 
     pub(super) fn pane_grip(&self, pane: &str, header: Option<f32>, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -62,7 +70,7 @@ impl AppWindow {
             .group("pane-grip")
             .cursor(if dragging { CursorStyle::ClosedHand } else { CursorStyle::OpenHand })
             .on_mouse_down(MouseButton::Left, cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                this.pane_press(&pane, ev.position, cx);
+                this.pane_press(&pane, ev.position, true, cx);
                 cx.stop_propagation();
             }))
             .children((0..2).map(|_| div().flex().gap(settings::z(3.)).children((0..3).map(|_| div().size(settings::z(2.)).rounded_full()
@@ -87,13 +95,19 @@ impl AppWindow {
         }
     }
 
-    pub(super) fn pane_press(&mut self, pane: &str, at: Point<Pixels>, cx: &mut Context<Self>) {
-        if self.pane_movable(pane) {
-            self.pane_drag = Some(PaneDrag {
-                pane: pane.to_owned(), tab: self.model.active_tab().unwrap().id.clone(),
-                down: at, moving: false, target: None,
-            });
+    pub(super) fn pane_press(&mut self, pane: &str, at: Point<Pixels>, grip: bool, cx: &mut Context<Self>) {
+        let Some(tab) = self.model.active_tab().filter(|t| t.root.find(pane).is_some()).map(|t| t.id.clone()) else { return };
+        if self.pane_movable(pane) && self.pane_layout_writable(pane) {
+            self.pane_drag = Some(PaneDrag { pane: pane.to_owned(), tab, down: at, grip, moving: false, target: None });
             cx.notify();
+        }
+    }
+
+    /// A press on a pane's header: it becomes a drag only once the pointer moves,
+    /// so a click still reaches the header's own buttons.
+    pub(super) fn pane_header_press(&mut self, pane: &str, at: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.pane_drag.is_none() {
+            self.pane_press(pane, at, false, cx);
         }
     }
 
@@ -131,9 +145,10 @@ impl AppWindow {
         let Some(d) = self.pane_drag.take() else { return false };
         if !d.moving {
             cx.notify();
-            return true;
+            return d.grip;
         }
         if self.pane_movable(&d.pane)
+            && self.pane_layout_writable(&d.pane)
             && let Some((target, edge)) = target
             && self.model.move_pane(&d.pane, &target, edge)
         {
@@ -159,7 +174,7 @@ impl AppWindow {
         });
         let this = cx.entity().downgrade();
         div().id("pane-drag-layer").absolute().inset_0()
-            .when(self.pane_drag.is_some(), |d| d.occlude().cursor(CursorStyle::ClosedHand))
+            .when(self.pane_drag.as_ref().is_some_and(|d| d.moving || d.grip), |d| d.occlude().cursor(CursorStyle::ClosedHand))
             .children(preview).child(canvas(
             |_, _, _| {},
             move |_, _, window, _| {

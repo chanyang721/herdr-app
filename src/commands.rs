@@ -60,6 +60,7 @@ pub const COMMANDS: &[Command] = &[
     cmd("pane.focus", &[opt("pane"), opt("terminal")], "Focus a pane (or the pane showing a terminal)."),
     cmd("pane.go", &[req("direction")], "Focus the pane or focusable mod to the \"left\", \"right\", \"up\" or \"down\"."),
     cmd("pane.swap", &[req("direction")], "Swap the focused pane with its neighbor in a direction."),
+    cmd("pane.move", &[opt("pane"), req("to"), opt("edge")], "Move a pane (default: the focused one) within its tab: swap places with `to` (a pane or terminal), or with `edge` \"left\", \"right\", \"up\" or \"down\" put it on that side of `to`. Its terminal keeps running."),
     cmd("terminal.peek", &[req("terminal")], "Peek at a running terminal over the tab, with keep-as-tab and close controls."),
     cmd("terminal.show", &[opt("terminal"), opt("pane")], "Show a terminal in a pane for now, in place of its own (no terminal: back)."),
     cmd("terminal.copy", &[], "Copy the focused terminal's selection. With nothing selected, that key goes to the program."),

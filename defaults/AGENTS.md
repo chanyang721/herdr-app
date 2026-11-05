@@ -236,14 +236,18 @@ Properties any node can have:
 - `padding`: space inside the node's edge, px: `16` or `[vertical, horizontal]`.
 - row/column: `gap` (px between children), `divider` (`{ "width": 1, "color": "border" }`),
   `resizable` (default true: drag the boundary). This applies to that row/column only.
-- `movable` (default true): panes can be dragged by the app's top-center grip within a split tab.
+- `movable` (default true): panes can be dragged within a split tab by the app's top-center
+  grip, or by pressing their header and moving.
   Unlike `resizable`, it inherits: the nearest explicit ancestor wins, through the
   tab tree and then the layout's tab block and its ancestors. Root `"movable": false`
   opts the layout out. Composition terminal blocks aren't tab panes and never drag.
   Center drop swaps panes; an edge drop places beside it. Escape or dropping outside
   another pane cancels. Zoomed tabs and one-pane tabs don't drag. The grip appears
-  on top-edge hover, regardless of the header's position or presence. Only the grip
-  starts dragging; header mods don't need drag handlers. `panes()` exposes `movable`.
+  on top-edge hover, regardless of the header's position or presence. A header press
+  the mod doesn't stop on mouse down drags once the pointer moves; without moving it
+  stays the header's click. Header mods don't need drag handlers; stop the press on
+  controls that shouldn't drag. Like resizing, a drag needs the machine's layout
+  to be saveable, when it starts and at the drop. `panes()` exposes `movable`.
 - `floating`: blocks over this node (below).
 - `window_drag: true`: dragging the node moves the window, a double-click
   maximizes it. A mod's own control inside opts out by stopping the press:
@@ -531,7 +535,9 @@ The main ones:
   skip settled tabs).
 - Panes: `pane.split {direction: "right" | "down", pane?, argv? | mod?, props?}` (a new
   terminal, or a mod pane), `pane.close {pane?}`,
-  `pane.zoom {pane?}`, `pane.focus {pane | terminal}`, `pane.go {direction}`, `pane.swap {direction}`.
+  `pane.zoom {pane?}`, `pane.focus {pane | terminal}`, `pane.go {direction}`, `pane.swap {direction}`,
+  `pane.move {pane?, to, edge?}` (onto pane or terminal `to` in the same tab: swap, or with
+  `edge` "left" | "right" | "up" | "down" beside it, as a drag drops it; the terminal keeps running).
   `pane.go` prefers the most recently focused pane along the nearest edge in that
   direction; unvisited panes fall back to overlap, then top/left layout order.
   `pane.go` also reaches visible mods whose `mod.json` says `"focusable": true`, and

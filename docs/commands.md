@@ -263,6 +263,16 @@ Swap the focused pane with its neighbor in a direction.
 |---|---|
 | `direction` | yes |
 
+## `pane.move`
+
+Move a pane (default: the focused one) within its tab: swap places with `to` (a pane or terminal), or with `edge` "left", "right", "up" or "down" put it on that side of `to`. Its terminal keeps running.
+
+| Argument | Required |
+|---|---|
+| `pane` | no |
+| `to` | yes |
+| `edge` | no |
+
 ## `terminal.peek`
 
 Peek at a running terminal over the tab, with keep-as-tab and close controls.
