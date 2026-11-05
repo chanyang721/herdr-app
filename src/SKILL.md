@@ -65,6 +65,11 @@ Use `commands` to confirm the command's exact shape:
 herdr-app do pane.split '{"direction":"right","pane":"p12"}'
 ```
 
+`terminal.search` opens a find bar in the focused terminal. It searches that
+terminal's screen and scrollback; Enter and Shift-Enter move between matches,
+Escape closes the bar while its find field has focus, and each terminal keeps its own query (reopening selects it, so typing replaces it).
+Clicking the terminal while the bar is open puts typing, including Escape, back in the program; the bar and its matches stay.
+
 It prints the created IDs (for example `{ "pane": "...", "terminal": "..." }`)
 or `{ "error": "..." }` and exits 1. Read the result, then inspect `ls` or
 `status` to confirm. Commands invoked by an agent never open a missing-argument
@@ -128,6 +133,22 @@ capture or permissions. It needs a running window that has drawn a frame;
 
 ## Problems and safety
 
+This local fork keeps space/tab/pane close and terminal.kill pending until the
+core's guarded batch returns an exact completion receipt. Refusal, unknown
+identity, unsupported core or remote target leaves the model in place. There is
+no single-terminal fallback. Uncertain operations retain a durable plan: retry
+the same target to reconcile its original operation without another kill. Use
+`terminal.close_reconcile {operation_id}` when the original container vanished. An
+exact audited receipt clears only original panes, preserving new content.
+Natural exits need a read-only native snapshot and signal-free audit of their
+pre-exit binding plus actual Exit witness; unbound exits remain visible. `pane.close` accepts `close_context: {mode:
+"automatic", handoff: "<one-use capability>"}` for lifecycle automation; the core passes it to the policy helper
+so automatic timing/focus/last-pane protections remain in force. Omission is an
+explicit/manual close. Unverified exit/rm events retain their session panes.
+Window close and app quit remain available and preserve sessions; terminal.kill
+from a mod's shutdown hook is refused. Close sessions through the guarded app
+commands before quitting instead.
+
 If Herdr misbehaves, `herdr-app feedback "<what happened>"` drafts a report.
 The person reviews and sends it; it does not silently send feedback.
 
@@ -135,3 +156,7 @@ Never experiment with pointer/key automation on the person's real display.
 When developing the app on Linux, its `scripts/sandbox` provides an isolated
 home, core and display: `up`, `do`, `status`, `shot`, then `down` when done.
 Never stop a server or session you didn't start.
+
+For corrupt close evidence, preserve the named file and restore the same operation
+from a verified backup, then run app.close_evidence_reload. Reload never closes
+a session or drops an in-memory uncertain scope.

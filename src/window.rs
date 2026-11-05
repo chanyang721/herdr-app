@@ -5,6 +5,7 @@
 //! anything: keys, mods, menus and agents all run them.
 
 use crate::hc::Core;
+mod close;
 mod floats;
 mod movable;
 mod pane_drag;
@@ -16,7 +17,7 @@ use crate::model::{self, Tab, Model};
 use crate::mods::{self, Found, Instance, Request};
 use crate::settings;
 use crate::layout_sync;
-use crate::terminal::{TerminalEvent, TerminalView};
+use crate::terminal::{TerminalEvent, TerminalView, scroll_target};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_shell::action::ShellAction;
@@ -380,6 +381,7 @@ pub struct AppWindow {
     /// Mods placed once; later the layout decides where (or whether) they show.
     seen: BTreeSet<String>,
     bounds: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
+    hidden_fit: pane_size::HiddenFit,
     drag: Option<Drag>,
     written_layout: String,
     /// The shown layout as its file has it; `chrome` is this plus the clicks
@@ -419,6 +421,17 @@ pub struct AppWindow {
     changing_terminals: HashSet<String>,
     /// Closed terminals stay excluded until kill completes and a listing drops them.
     closing_terminals: HashMap<String, bool>,
+    // Pending/denied operations cannot be pruned by terminal events or reconciliation.
+    close_holds: HashSet<String>,
+    pending_close: Option<close::Plan>,
+    retained_closes: BTreeMap<String, close::Plan>,
+    close_evidence_error: Option<String>,
+    automatic_close_pending: bool,
+    natural_audit_attempted: HashSet<String>,
+    natural_audit_status: HashMap<String, close::AuditRetry>,
+    observed_audit: Option<close::Plan>,
+    observed_completion: Option<(close::Plan, Result<close::Resolution,String>, u64)>,
+    close_deferred_documents: Vec<(Option<Value>, Vec<(String, crate::mirror_sync::Outcome)>)>,
     pending_terminals: std::collections::BTreeMap<String, PendingTerminalChange>,
     /// Each machine owns a document; the empty key is this core.
     documents: std::collections::BTreeMap<String, crate::mirror_sync::Slot>,
@@ -431,6 +444,8 @@ pub struct AppWindow {
     /// The mod block holding the keyboard for directional navigation.
     focused_block: Option<String>,
     synced_model_pane: Option<String>,
+    /// Whether the last sync showed the tab, to hand it the keyboard back when a stack shows it again.
+    tab_shown: bool,
     pane_history: Vec<String>,
     window_active: bool,
     /// The system's appearance; a layout with a light and a dark theme follows it.
@@ -458,6 +473,10 @@ impl AppWindow {
         let runtime = ShellRuntime::new(cx).map_err(|e| tracing::error!("script runtime failed, mods are off: {e:#}")).ok();
         mods::note_fonts(cx);
         let seen = std::fs::read_to_string(file("seen.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let retained=close::load_pending(&file("close-pending"),core.hello["core"]["id"].as_str().unwrap_or_default());
+        let close_evidence_error=retained.as_ref().err().cloned();
+        let retained_closes=retained.unwrap_or_default();
+        let close_holds=retained_closes.values().filter(|p|!p.ui_applied).flat_map(|p|p.expected.iter().map(|i|i.address.clone())).collect();
         let mut w = AppWindow {
             core,
             runtime,
@@ -482,6 +501,7 @@ impl AppWindow {
             folders: mods::scan().into_iter().map(|f| (f.id.clone(), f)).collect(),
             seen,
             bounds: Default::default(),
+            hidden_fit: Default::default(),
             drag: None,
             written_layout: String::new(),
             file_chrome: default_layout("main"),
@@ -506,6 +526,16 @@ impl AppWindow {
             draining: false,
             changing_terminals: HashSet::new(),
             closing_terminals: HashMap::new(),
+            close_holds,
+            pending_close: None,
+            retained_closes,
+            close_evidence_error,
+            automatic_close_pending: false,
+            natural_audit_attempted: HashSet::new(),
+            natural_audit_status: HashMap::new(),
+            observed_audit: None,
+            observed_completion: None,
+            close_deferred_documents: Vec::new(),
             pending_terminals: Default::default(),
             documents: {
                 let mut local = crate::mirror_sync::Slot::default();
@@ -519,6 +549,7 @@ impl AppWindow {
             focused_pane: None,
             focused_block: None,
             synced_model_pane: None,
+            tab_shown: true,
             pane_history: Vec::new(),
             window_active: true,
             system_dark: is_dark(window.appearance()),
@@ -691,6 +722,7 @@ impl AppWindow {
                         None => this.tend_terminals(false, window, cx),
                     }
                     if changed { this.sync(window, cx); }
+                    this.fit_hidden_tabs(window, cx);
                     this.flush_documents(refresh, window, cx);
                 }).is_err() { break; }
                 cx.background_executor().timer(Duration::from_millis(500)).await;
@@ -796,6 +828,7 @@ impl AppWindow {
     fn reconnected(&mut self, core: Arc<Core>, cx: &mut Context<Self>) {
         tracing::info!("reconnected to the core");
         self.core_generation += 1;
+        self.close_deferred_documents.clear();
         self.documents_watching = false;
         for (machine, slot) in &mut self.documents {
             slot.available = false;
@@ -1355,6 +1388,7 @@ impl AppWindow {
 
     /// Makes `addr` the shown agent; a pane showing it also becomes the focused pane.
     fn focus_agent(&mut self, addr: &str) {
+        if self.automatic_close_pending { return; }
         if let Some(p) = self.model.pane_of(addr) {
             self.model.focus_pane(&p);
         }
@@ -1466,8 +1500,13 @@ impl AppWindow {
         self.synced_model_pane = model_pane;
         self.focused_pane = focused.clone();
         let no_dialog = !self.overlays.iter().any(|o| o.kind.modal_keys());
+        // The tab shown again (`layout.select` back from another stack child): its
+        // focused pane gets the keyboard, which went to the window while it was hidden.
+        let tab_shown = self.shows_tab();
+        let revealed = tab_shown && !self.tab_shown;
+        self.tab_shown = tab_shown;
         if terminal_block(&self.chrome, focused.as_deref()).is_some() {
-            if pane_changed && no_dialog && let Some(f) = focused.as_deref().and_then(|p| self.pane_focus(p)) {
+            if pane_changed && no_dialog && let Some(f) = focused.as_deref().and_then(|p| self.pane_focus(p, cx)) {
                 f.focus(window, cx);
             }
         } else if let Some(block) = self.agent_block() {
@@ -1484,8 +1523,10 @@ impl AppWindow {
             // A mod pane takes the keyboard on a click; until then the window holds
             // it, so another tab's terminal can't keep it (and pull its tab back).
             if no_dialog {
-                focused.and_then(|p| self.pane_focus(&p)).unwrap_or_else(|| self.focus.clone()).focus(window, cx);
+                focused.and_then(|p| self.pane_focus(&p, cx)).unwrap_or_else(|| self.focus.clone()).focus(window, cx);
             }
+        } else if revealed {
+            self.refocus_pane(window, cx);
         }
         if self.window_active {
             let visible = self.visible_addresses();
@@ -1547,11 +1588,11 @@ impl AppWindow {
             return self.hand_keyboard();
         }
         let shown = if terminal_block(&self.chrome, self.focused_pane.as_deref()).is_some() {
-            self.focused_pane.as_deref().and_then(|p| self.pane_focus(p))
+            self.focused_pane.as_deref().and_then(|p| self.pane_focus(p, cx))
         } else if let Some(block) = self.agent_block() {
             self.shown_agent().and_then(|a| self.agent_view(&block, &a)).map(|t| t.focus.clone())
         } else if self.shows_tab() {
-            self.model.focused_pane().and_then(|p| self.pane_focus(&p))
+            self.model.focused_pane().and_then(|p| self.pane_focus(&p, cx))
         } else {
             None
         };
@@ -1566,7 +1607,7 @@ impl AppWindow {
     /// Key path for `terminal.copy`. Copies and clears when there is a selection.
     /// Returns whether it copied. False means the key should reach the program.
     fn copy_key(&mut self, window: &Window, cx: &mut Context<Self>) -> bool {
-        let Some(t) = self.focused_terminal(window) else { return true };
+        let Some(t) = self.focused_terminal(window, cx) else { return true };
         t.view.update(cx, |v, cx| {
             if !v.copy(cx) {
                 return false;
@@ -1577,14 +1618,53 @@ impl AppWindow {
     }
 
     /// Peeks, floats and swapped-in views own keyboard focus without changing the model pane.
-    fn focused_terminal(&self, window: &Window) -> Option<&Term> {
-        self.terms.values().find(|t| t.focus.is_focused(window))
+    fn focused_terminal(&self, window: &Window, cx: &App) -> Option<&Term> {
+        self.terms.values().find(|t| t.view.read(cx).owns_keyboard_focus(window, cx))
             .or_else(|| self.focused_pane.as_deref().and_then(|p| self.pane_term(p)))
             .or_else(|| self.model.focused_pane().and_then(|p| self.pane_term(&p)))
     }
 
-    fn pane_focus(&self, pane: &str) -> Option<FocusHandle> {
-        self.pane_term(pane).map(|t| t.focus.clone())
+    fn shown_terminal_view(&self, address: &str, window: &Window, cx: &App) -> Result<Entity<TerminalView>, String> {
+        if !self.live.contains_key(address) {
+            return Err(format!("no running terminal {address:?}"));
+        }
+
+        let own_pane = self.model.pane_of(address);
+        // The view the person sees wins over a hidden one, such as a peek over its own tab's pane.
+        let best = self.terms.iter().filter(|(_, t)| t.address == address).max_by_key(|(pane, t)| {
+            let view = t.view.read(cx);
+            (view.owns_keyboard_focus(window, cx), view.on_screen_this_frame(), own_pane.as_deref() == Some(pane.as_str()))
+        });
+        best.map(|(_, t)| t.view.clone()).ok_or_else(|| format!("terminal {address:?} is running but not shown in this window, so it has no view to scroll"))
+    }
+
+    fn scroll_terminal(&self, args: &Value, window: &Window, cx: &mut Context<Self>) -> Result<(), String> {
+        let target = scroll_target(args)?;
+
+        let view = match Self::owned(args, "terminal") {
+            Some(address) => self.shown_terminal_view(&address, window, cx)?,
+            None => self.focused_terminal(window, cx).map(|t| t.view.clone()).ok_or("no focused terminal to scroll")?,
+        };
+
+        view.update(cx, |view, cx| view.scroll_history(target, cx));
+        Ok(())
+    }
+
+    /// Gives the focused pane the keyboard, unless something other than the
+    /// window holds it: a dialog, a mod block, an input.
+    fn refocus_pane(&self, window: &mut Window, cx: &mut App) {
+        let dialog = self.overlays.iter().any(|o| o.kind.modal_keys());
+        let window_holds_keys = window.focused(cx).is_none() || self.focus.is_focused(window);
+        if dialog || self.focused_block.is_some() || !window_holds_keys {
+            return;
+        }
+        if let Some(f) = self.focused_pane.as_ref().and_then(|p| self.pane_focus(p, cx)) {
+            f.focus(window, cx);
+        }
+    }
+
+    fn pane_focus(&self, pane: &str, cx: &App) -> Option<FocusHandle> {
+        self.pane_term(pane).map(|t| t.view.read(cx).focus_target(cx))
     }
 
     fn load(&self, inst: Instance, window: &mut Window, cx: &mut Context<Self>) -> Copy {
@@ -1847,6 +1927,10 @@ impl AppWindow {
     }
 
     fn documents_updated(&mut self, machines: Option<Value>, results: Vec<(String, crate::mirror_sync::Outcome)>, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.automatic_close_pending {
+            self.close_deferred_documents.push((machines,results));
+            return false;
+        }
         use crate::mirror_sync::Outcome;
         let mut changed = false;
         // The listing every 500 ms brings the machines alone: redraw only when
@@ -1928,6 +2012,7 @@ impl AppWindow {
             self.model.spaces.retain(|s| s.machine.as_deref().is_none_or(|m| states.contains_key(m)));
             changed |= before != self.model.spaces.len();
         }
+        self.cleanup_close_evidence();
         if !listing || changed || shown(&self.documents) != was {
             self.publish(cx);
             cx.notify();
@@ -2074,6 +2159,26 @@ impl AppWindow {
         let missing = self.model.tabs().flat_map(|c| c.root.terminals())
             .filter_map(|n| n.terminal().filter(|a| !self.live.contains_key(*a) && !self.just_born(a)).map(|a| (n.id.clone(), a.to_owned())))
             .collect::<Vec<_>>();
+        // Every retained missing pane gets an explanation, even while a
+        // different observation is using the one background slot.
+        let waiting=missing.iter().filter(|(_,a)|!self.natural_audit_status.contains_key(a)
+            && !self.closing_terminals.get(a).copied().unwrap_or(false))
+            .map(|(_,a)|a.clone()).collect::<Vec<_>>();
+        for address in waiting {
+            let reason=if self.close_holds.contains(&address) {
+                "The original close outcome is unverified. Retry the original pane/tab/workspace close to reconcile it."
+            } else {
+                "Waiting for verified exit evidence. Close this pane to request cleanup."
+            };
+            self.cleanup_wait_reason(&[address],reason,cx);
+        }
+        if self.pending_close.is_none() && self.observed_audit.is_none() && self.observed_completion.is_none()
+            && let Some((_,address))=missing.iter().find(|(_,a)|!self.close_holds.contains(a) && !self.natural_audit_attempted.contains(a)
+                && self.natural_audit_status.get(a).is_none_or(|state|state.ready(Instant::now()))
+                && !self.closing_terminals.get(a).copied().unwrap_or(false)) {
+            self.begin_natural_audit(close::Target::Terminal(address.clone()),true,window,cx);
+        }
+        let missing = missing.into_iter().filter(|(_, address)| close::may_prune(self.closing_terminals.get(address).copied().unwrap_or(false), self.close_holds.contains(address))).collect::<Vec<_>>();
         if !missing.is_empty() && !self.checking_closed {
             self.check_closed(missing, window, cx);
         }
@@ -2231,6 +2336,15 @@ impl AppWindow {
     }
 
     fn terminal_ended(&mut self, block: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // A natural exit/--rm is an observation, not a batch authorization.
+        let represented = self.model.address_of(block)
+            .or_else(|| self.chrome.find(block).and_then(Node::terminal).map(str::to_owned));
+        if let Some(address)=represented
+            && !close::may_prune(self.closing_terminals.get(&address).copied().unwrap_or(false),self.close_holds.contains(&address)) {
+            if !self.close_holds.contains(&address) {self.begin_natural_audit(close::Target::Terminal(address),true,window,cx);}
+            else {self.cleanup_wait_reason(&[address],"Waiting for the original close receipt. Retry the original close if its outcome is unknown.",cx);}
+            return;
+        }
         if let Some(pane) = block.strip_suffix(SWAP) {
             self.swapped.remove(pane);
             self.focused_pane = None;
@@ -2312,15 +2426,15 @@ impl AppWindow {
     /// Starts a terminal for `space`, on `on` (another machine) or here. An
     /// empty `cwd`: the machine's home. With no argv, that machine's core
     /// picks its own shell.
-    fn spawn(&self, argv: Option<Vec<String>>, cwd: String, space: &str, ctx: &str, on: Option<&str>, size: Option<(u16, u16)>) -> Result<String, String> {
+    fn spawn(&self, argv: Option<Vec<String>>, cwd: String, space: &str, ctx: &str, on: Option<&str>, size: Option<(u16, u16)>, window: &Window) -> Result<String, String> {
         let argv = argv.unwrap_or_default();
         let cwd = Some(cwd).filter(|c| !c.is_empty());
         self.require_document(on)?;
         let labels = json!({ "herdr.space": crate::mirror::local(space, on), "herdr.tab": crate::mirror::local(ctx, on), "herdr.seen": "0" });
-        let addr = match self.core.run(argv.clone(), cwd.clone(), labels.clone(), on, size) {
+        let addr = match self.core.run(argv.clone(), cwd.clone(), labels.clone(), on, size, crate::terminal::initial_display(window)) {
             // An agent on a machine without `sh` (Windows): in its PowerShell instead.
             Err(e) if on.is_some() && argv.first().map(String::as_str) == Some("sh") && format!("{e:#}").contains("not found") => {
-                self.core.run(Self::powershell_argv(&argv), cwd, labels, on, size)
+                self.core.run(Self::powershell_argv(&argv), cwd, labels, on, size, crate::terminal::initial_display(window))
             }
             r => r,
         }
@@ -2366,7 +2480,7 @@ impl AppWindow {
         let folder = folder.or_else(here).unwrap_or_else(|| if on.is_some() { String::new() } else { home() });
         let (space, ctx, pane) = (self.model.fresh_id_on("sp", on), self.model.fresh_id_on("tb", on), self.model.fresh_id_on("p", on));
         let size = self.initial_size(&Tab::new(&ctx, "", &pane, "").root, &pane, window);
-        let addr = self.spawn(Self::agent_argv(argv.clone(), task, on).or(argv), folder.clone(), &space, &ctx, on, size)?;
+        let addr = self.spawn(Self::agent_argv(argv.clone(), task, on).or(argv), folder.clone(), &space, &ctx, on, size, window)?;
         let ctx_name = ctx_name.map(str::trim).unwrap_or_default();
         self.model.add_space(&space, name.trim(), &folder, Tab::new(&ctx, ctx_name, &pane, &addr));
         if let Some(p) = self.model.space_mut(&space) {
@@ -2385,7 +2499,7 @@ impl AppWindow {
         let on = self.machine_of(&space);
         let (ctx, pane) = (self.model.fresh_id_on("tb", on.as_deref()), self.model.fresh_id_on("p", on.as_deref()));
         let size = self.initial_size(&Tab::new(&ctx, "", &pane, "").root, &pane, window);
-        let addr = self.spawn(Self::agent_argv(argv.clone(), task, on.as_deref()).or(argv), folder, &space, &ctx, on.as_deref(), size)?;
+        let addr = self.spawn(Self::agent_argv(argv.clone(), task, on.as_deref()).or(argv), folder, &space, &ctx, on.as_deref(), size, window)?;
         self.model.add_tab(&space, Tab::new(&ctx, name.trim(), &pane, &addr));
         self.model.active = Some(space.clone());
         Ok(json!({ "space": space, "tab": ctx, "terminal": addr }))
@@ -2421,7 +2535,7 @@ impl AppWindow {
         root.split(&target, axis, Node::block(new.clone(), Content::Terminal { terminal: String::new() }), "initial-size".into());
         let size = self.model.active_tab().filter(|tab| tab.id == ctx)
             .and_then(|_| self.initial_size(&root, &new, window));
-        let addr = self.spawn(argv, cwd, &space, &ctx, on.as_deref(), size)?;
+        let addr = self.spawn(argv, cwd, &space, &ctx, on.as_deref(), size, window)?;
         self.model.split(&target, axis, &new, &addr);
         Ok(json!({ "pane": new, "terminal": addr }))
     }
@@ -2459,6 +2573,7 @@ impl AppWindow {
                 if generation != this.core_generation { return; }
                 let mut changed = false;
                 for (pane, addr) in closed {
+                    if !close::may_prune(this.closing_terminals.get(&addr).copied().unwrap_or(false), this.close_holds.contains(&addr)) { continue; }
                     if this.model.address_of(&pane).as_deref() == Some(&addr) {
                         this.notify_launch_failure(&addr, window, cx);
                         this.model.remove_pane(&pane);
@@ -2584,42 +2699,368 @@ impl AppWindow {
         }
     }
 
-    /// Kills terminals and their sub-agents, all the way down. Core keeps a
-    /// sub-agent running when its parent dies; closing one here means done with
-    /// its whole tree. Kept sub-agents (given a tab) are the person's: spared.
-    fn kill(&mut self, addresses: &[String], cx: &mut Context<Self>) {
-        let mut doomed: Vec<String> = addresses.to_vec();
-        let mut i = 0;
-        while i < doomed.len() {
-            let parent = doomed[i].clone();
-            for (addr, rec) in &self.live {
-                let child = rec.get("parent").and_then(Value::as_str) == Some(parent.as_str());
-                let kept = rec.get("labels").and_then(|l| l.get("herdr.space")).and_then(Value::as_str).is_some_and(|w| !w.is_empty());
-                if child && !kept && !doomed.contains(addr) {
-                    doomed.push(addr.clone());
-                }
-            }
-            i += 1;
+    /// Do not remove even one pane until the guarded core batch has completed.
+    fn begin_close(&mut self, target: close::Target, context: Value, window: &mut Window, cx: &mut Context<Self>) {
+        self.begin_close_request(target,context,None,window,cx);
+    }
+
+    fn begin_close_request(&mut self, target: close::Target, context: Value, recovery: Option<close::Plan>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_close.is_some() { return self.fail("another guarded close is pending"); }
+        if self.draining || !self.changing_terminals.is_empty() || self.drag.is_some() || self.pane_drag.is_some() {
+            return self.fail("terminal/layout change in progress; retry close when settled");
         }
-        self.closing_terminals.extend(doomed.iter().cloned().map(|a| (a, false)));
-        // Off the UI thread: a kill waits for the program to go, and for slow machines.
+        if let Some(error)=&self.close_evidence_error { return self.fail(format!("retained close evidence requires recovery: {error}")); }
+        if let Err(error) = close::validate_context(&context) { return self.fail(error); }
+        let retained=recovery.or_else(||self.retained_closes.values().find(|p|p.target==target && p.represented(&self.model)).cloned());
+        let recovering=retained.is_some();
+        let plan=match retained.map(Ok).unwrap_or_else(||close::Plan::capture(target.clone(),&self.model,&self.live)) {
+            Ok(plan)=>plan,
+            Err(_error)=>return self.begin_natural_audit(target,false,window,cx),
+        };
+        if plan.expected.is_empty() {
+            let result = plan.finish(&mut self.model, plan.completed(vec![]));
+            if let Err(error) = result { return self.fail(error); }
+            self.sync(window, cx);
+            return;
+        }
+        if !close::supported(&self.core.hello) { return self.fail("core does not support guarded close and recovery; no terminal was signalled"); }
+        if let Some(active)=&self.observed_audit
+            && (active.operation_id==plan.operation_id || (!recovering && active.roots==plan.roots)) {
+            self.answer(Ok(json!({"pending":true,"operation":"natural_exit_audit","operation_id":active.operation_id})));
+            return;
+        }
+        if recovering && self.observed_audit.as_ref().is_some_and(|active|active.operation_id!=plan.operation_id
+            && active.expected.iter().any(|i|plan.expected.iter().any(|p|p.address==i.address))) {
+            return self.fail("A separate observed audit owns this scope. Its result is preserved; retry this original operation afterward.");
+        }
+        if !recovering && plan.expected.iter().any(|i|self.close_holds.contains(&i.address)) {
+            return self.fail("an earlier close must be reconciled using its original target");
+        }
+        if !recovering {
+            let core_id=self.core.hello["core"]["id"].as_str().unwrap_or_default();
+            if let Err(error)=close::save_pending(&file("close-pending"),core_id,&plan) { return self.fail(format!("cannot preserve close evidence: {error}")); }
+            self.retained_closes.insert(plan.operation_id.clone(),plan.clone());
+        }
+        if plan.roots.iter().any(|a|self.natural_audit_status.contains_key(a)) {
+            self.cleanup_wait_reason(&plan.roots,"Checking close approval; the pane is preserved until its exact receipt.",cx);
+        }
+        self.automatic_close_pending=context["mode"]=="automatic";
+        self.close_holds.extend(plan.expected.iter().map(|i| i.address.clone()));
+        self.pending_close = Some(plan.clone());
+        self.answer(Ok(json!({"pending":true,"operation":if recovering {"close_reconcile"}else{"guarded_close"},"operation_id":plan.operation_id})));
         let core = self.core.clone();
-        cx.spawn(async move |this, cx| {
-            for address in doomed {
-                let core = core.clone();
-                let addr = address.clone();
-                let result = cx.background_executor().spawn(async move {
-                    core.call("terminal.kill", json!({ "terminal": addr }))
-                }).await;
-                let _ = this.update(cx, |this, _| {
-                    if result.is_ok() && this.live.contains_key(&address) {
-                        // The live snapshot may still predate the kill's reply.
-                        this.closing_terminals.insert(address, true);
-                    } else {
-                        this.closing_terminals.remove(&address);
-                    }
-                });
+        let generation = self.core_generation;
+        cx.spawn_in(window, async move |this, cx| {
+            let work = plan.clone();
+            let result = cx.background_executor().spawn(async move {
+                if recovering {
+                    work.reconcile_guarded(|params|core.call_timeout("terminal.close_reconcile",params,Duration::from_secs(300))
+                        .map_err(|error|close::CallFailure {kind:crate::hc::error_kind(&error).map(str::to_owned),message:format!("{error:#}")}))
+                } else {
+                    work.execute_guarded(&context, |params| core.call_timeout("terminal.kill_batch", params, Duration::from_secs(300))
+                        .map_err(|error| close::CallFailure {
+                            kind:crate::hc::error_kind(&error).map(str::to_owned), message:format!("{error:#}"),
+                        }))
+                }
+            }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.pending_close.take();
+                this.automatic_close_pending=false;
+                if this.draining || generation != this.core_generation { this.finish_observed_audit(window,cx); return; }
+                this.complete_close_request(&plan,result,recovering,false,window,cx);
+
+            });
+        }).detach();
+    }
+
+    fn complete_close_request(&mut self, plan: &close::Plan, result: Result<close::Resolution,String>, recovering: bool, observation: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let result=match result {
+            Ok(close::Resolution::Closed(completed))=>Ok(completed),
+            Ok(close::Resolution::Cancelled)=>{
+                if plan.roots.iter().any(|a|self.natural_audit_status.contains_key(a)) {
+                    self.cleanup_wait_reason(&plan.roots,"Approval was cancelled before termination. Complete the required report/review, then close this pane to retry.",cx);
+                }
+                // This proof certifies no signal, not successful termination.
+                // Preserve the entire model, retire the hold, require a new request.
+                if let Err(error)=close::remove_pending(&file("close-pending"),&plan) {
+                    self.layout_notice("Close recovery could not be saved",&error,window,cx);
+                } else {
+                    self.retained_closes.remove(&plan.operation_id);
+                    for identity in &plan.expected { self.close_holds.remove(&identity.address); }
+                    if !observation {self.layout_notice("Close was cancelled before termination","The layout is unchanged. Retry close when ready.",window,cx);}
+                }
+                for (machines,results) in std::mem::take(&mut self.close_deferred_documents) {
+                    self.documents_updated(machines,results,window,cx);
+                }
+                self.finish_observed_audit(window,cx);
+                return;
             }
+            Err(error)=>Err(error),
+        };
+        let finished=if recovering {plan.finish_reconciled(&mut self.model,result)}else{plan.finish(&mut self.model,result)};
+        match finished {
+            Ok(()) => {
+                // Persist proof state before retiring the file. Startup does not
+                // resurrect a completed hold; a failed layout write can still
+                // recover the original operation and exact scope.
+                let core_id=self.core.hello["core"]["id"].as_str().unwrap_or_default();
+                match close::mark_applied(&file("close-pending"),core_id,plan) {
+                    Ok(marked)=>{self.retained_closes.insert(marked.operation_id.clone(),marked);}
+                    Err(error)=>{self.layout_notice("Close evidence needs recovery",&error,window,cx);}
+                }
+                let blocks = self.chrome.terminals().iter().filter(|node| node.terminal().is_some_and(|address| plan.expected.iter().any(|identity| identity.address == address)))
+                    .map(|node| node.id.clone()).collect::<Vec<_>>();
+                for block in blocks { self.chrome.remove(&block); }
+                for identity in &plan.expected {
+                    self.natural_audit_status.remove(&identity.address);
+                    self.close_holds.remove(&identity.address);
+                    self.closing_terminals.insert(identity.address.clone(), true);
+                }
+                self.sync(window, cx);
+                self.flush_documents(false, window, cx);
+            }
+            Err(error) => {
+                if plan.roots.iter().any(|a|self.natural_audit_status.contains_key(a)) {
+                    self.cleanup_wait_reason(&plan.roots,&error,cx);
+                }
+                // Keep holds: timeout/partial termination is never permission to prune.
+                if !observation {self.layout_notice("Session close refused", &error, window, cx);}
+            }
+        }
+        for (machines,results) in std::mem::take(&mut self.close_deferred_documents) {
+            self.documents_updated(machines,results,window,cx);
+        }
+        self.finish_observed_audit(window,cx);
+
+    }
+
+
+    /// A confirmed core layout document must no longer contain the terminal;
+    /// current UI absence alone never proves that restart recovery is unnecessary.
+    fn cleanup_close_evidence(&mut self) {
+        if !self.retained_closes.values().any(|plan|plan.ui_applied) {return}
+        let Some(slot)=self.documents.get("") else {return};
+        if !slot.available {return}
+        let Some(document)=&slot.document else {return};
+        let mut persisted=Model::default();document.replace(&mut persisted,None);
+        let ready=self.retained_closes.values().filter(|plan|
+            self.pending_close.as_ref().is_none_or(|p|p.operation_id!=plan.operation_id)
+            && self.observed_audit.as_ref().is_none_or(|p|p.operation_id!=plan.operation_id)
+            && self.observed_completion.as_ref().is_none_or(|(p,_,_)|p.operation_id!=plan.operation_id)
+            && plan.cleanup_ready(&self.model,&persisted)
+            && !self.chrome.terminals().iter().chain(self.file_chrome.terminals().iter())
+                .any(|n|n.terminal().is_some_and(|a|plan.expected.iter().any(|i|i.address==a))))
+            .cloned().collect::<Vec<_>>();
+        for plan in ready {
+            match close::remove_pending(&file("close-pending"),&plan) {
+                Ok(())=>{self.retained_closes.remove(&plan.operation_id);}
+                Err(error)=>tracing::warn!("completed close evidence retained: {error}"),
+            }
+        }
+    }
+
+    fn close_mouse_allowed(&self, at: Point<Pixels>) -> bool {
+        if !self.automatic_close_pending {return true}
+        let focus=self.focused_block.clone().or_else(||self.focused_pane.clone()).or_else(||self.model.focused_pane());
+        focus.as_ref().and_then(|id|self.bounds.borrow().get(id).copied()).is_some_and(|bounds|bounds.contains(&at))
+    }
+
+    fn reload_close_evidence(&mut self) -> Result<(),String> {
+        if self.pending_close.is_some() {return Err("wait for the pending close before reloading evidence".into())}
+        let core_id=self.core.hello["core"]["id"].as_str().ok_or("missing core identity")?;
+        let restored=close::load_pending(&file("close-pending"),core_id)?;
+        for (op,plan) in &restored {
+            if self.retained_closes.get(op).is_some_and(|old|!old.same_scope(plan)) {
+                return Err(format!("repaired file changes original operation scope: {op}"));
+            }
+        }
+        // Merge, never drop an in-memory uncertain scope just because its file
+        // disappeared. Reload is not permission to release a hold or prune UI.
+        for (op,plan) in restored {
+            if !plan.ui_applied {self.close_holds.extend(plan.expected.iter().map(|i|i.address.clone()));}
+            self.retained_closes.entry(op).or_insert(plan);
+        }
+        self.close_evidence_error=None;
+        self.cleanup_close_evidence();Ok(())
+    }
+
+    fn cleanup_wait_reason(&mut self, roots: &[String], reason: &str, cx: &mut Context<Self>) {
+        let mut changed=false;
+        for address in roots {
+            let state=self.natural_audit_status.entry(address.clone()).or_default();
+            if state.reason!=reason {state.waiting(reason);changed=true;}
+        }
+        if changed {cx.notify();}
+    }
+
+    fn finish_observed_audit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_close.is_some() || self.draining {return}
+        let Some((plan,result,generation))=self.observed_completion.take() else {return};
+        if self.retained_closes.values().any(|other|other.operation_id!=plan.operation_id && !other.ui_applied
+            && other.expected.iter().any(|i|plan.expected.iter().any(|p|p.address==i.address))) {
+            self.cleanup_wait_reason(&plan.roots,"Another original operation owns this scope. Reconcile it before cleanup.",cx);
+            self.observed_completion=Some((plan,result,generation));
+            return;
+        }
+        if generation!=self.core_generation {
+            self.cleanup_wait_reason(&plan.roots,"The core reconnected. Close this pane to revalidate its original operation.",cx);
+            return;
+        }
+        self.complete_close_request(&plan,result,true,true,window,cx);
+    }
+
+    fn cleanup_wait_banner(&self, address: &str) -> Option<AnyElement> {
+        self.natural_audit_status.get(address).map(|state|
+            div().flex_none().w_full().px_2().py_1()
+                .bg(c("background")).text_color(c("foreground"))
+                .text_size(settings::z(11.)).child(state.message()).into_any_element())
+    }
+
+    /// An existing exit/missing-pane event requests a signal-free audit. It
+    /// never restores blanket prune permission and never starts a new kill.
+    fn begin_natural_audit(&mut self, target: close::Target, observation: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.draining {return}
+        let mut draft=match close::Plan::audit_draft(target,&self.model) {
+            Ok(plan)=>plan,
+            Err(error)=>{if !observation {self.fail(error);} return;}
+        };
+        if !self.changing_terminals.is_empty() {
+            self.cleanup_wait_reason(&draft.roots,"Waiting for the current terminal layout update; this pane is preserved.",cx);
+            return;
+        }
+        if let Some(active)=&self.observed_audit {
+            if observation {
+                let waiting=draft.roots.iter().filter(|a|!self.natural_audit_status.contains_key(*a)).cloned().collect::<Vec<_>>();
+                self.cleanup_wait_reason(&waiting,"Another cleanup check is running. Retry this pane's close when ready.",cx);
+                return;
+            }
+            if draft.roots==active.roots {
+                self.answer(Ok(json!({"pending":true,"operation":"natural_exit_audit","operation_id":active.operation_id})));
+                return;
+            }
+            if draft.roots.iter().any(|a|active.roots.contains(a)) {
+                return self.fail("This scope overlaps an existing cleanup audit. Close its original pane to join it.");
+            }
+        }
+        if self.pending_close.is_some() {
+            self.cleanup_wait_reason(&draft.roots,"Waiting for your current close to finish; this pane is preserved.",cx);
+            if !observation {self.fail("another guarded close is pending");}
+            return;
+        }
+        if !observation {
+            if let Some(plan)=self.retained_closes.values().find(|p|p.roots==draft.roots).cloned() {
+                return self.begin_close_request(plan.target.clone(),Value::Null,Some(plan),window,cx);
+            }
+        } else if let Some(plan)=self.retained_closes.values().find(|p|p.ui_applied && p.roots==draft.roots).cloned() {
+            draft=plan;
+        }
+        if draft.roots.iter().any(|a|self.close_holds.contains(a)) {
+            self.cleanup_wait_reason(&draft.roots,"An uncertain original operation is preserved. Close this pane to reconcile it.",cx);
+            if !observation {self.fail("reconcile the original held operation first");}
+            return;
+        }
+        if observation {
+            if self.observed_completion.is_some() {
+                let waiting=draft.roots.iter().filter(|a|!self.natural_audit_status.contains_key(*a)).cloned().collect::<Vec<_>>();
+                self.cleanup_wait_reason(&waiting,"Waiting for another cleanup receipt. Close this pane to request verification.",cx);
+                return;
+            }
+            if draft.roots.iter().any(|a|self.natural_audit_attempted.contains(a)
+                || self.natural_audit_status.get(a).is_some_and(|state|!state.ready(Instant::now()))) {return}
+            for address in &draft.roots {self.natural_audit_status.entry(address.clone()).or_default().start(Instant::now());}
+        }
+        let unavailable=if let Some(error)=&self.close_evidence_error {
+            Some(format!("Retained close evidence requires repair: {error}"))
+        } else if !close::supported(&self.core.hello) || !self.core.hello["methods"].as_array().is_some_and(|m|m.iter().any(|v|v=="terminal.close_snapshot")) {
+            Some("The core does not support verified natural-exit cleanup. The pane is preserved.".into())
+        } else {None};
+        if let Some(error)=unavailable {
+            self.cleanup_wait_reason(&draft.roots,&error,cx);
+            if !observation {self.fail(error);} return;
+        }
+        let core_id=self.core.hello["core"]["id"].as_str().unwrap_or_default().to_owned();
+        if core_id.is_empty() {
+            self.cleanup_wait_reason(&draft.roots,"The core identity is unavailable. The pane is preserved.",cx);
+            if !observation {self.fail("missing native core identity");} return;
+        }
+        if observation {self.observed_audit=Some(draft.clone());}
+        else {
+            self.pending_close=Some(draft.clone());
+            self.answer(Ok(json!({"pending":true,"operation":"natural_exit_audit","operation_id":draft.operation_id})));
+        }
+        self.cleanup_wait_reason(&draft.roots,"Checking native exit and audit evidence.",cx);
+        let core=self.core.clone();let generation=self.core_generation;
+        cx.spawn_in(window,async move |this,cx| {
+            let original=draft.clone();let lookup=core.clone();let lookup_id=core_id.clone();
+            let prepared=cx.background_executor().spawn(async move {
+                if !draft.expected.is_empty() {return Ok(draft);}
+                let snapshot=lookup.call_timeout("terminal.close_snapshot",json!({"roots":draft.roots}),Duration::from_secs(15))
+                    .map_err(|e|format!("{e:#}"))?;
+                draft.audit_snapshot(&lookup_id,snapshot)
+            }).await;
+            let plan=this.update_in(cx,|this,window,cx| {
+                let clear_slot=|this:&mut Self| {
+                    if observation {
+                        if this.observed_audit.as_ref().is_some_and(|p|p.operation_id==original.operation_id) {this.observed_audit=None;}
+                    } else if this.pending_close.as_ref().is_some_and(|p|p.operation_id==original.operation_id) {this.pending_close=None;}
+                };
+                if this.draining || generation!=this.core_generation || this.core.hello["core"]["id"].as_str()!=Some(core_id.as_str()) {
+                    clear_slot(this);return None;
+                }
+                let plan=match prepared {
+                    Ok(plan)=>plan,
+                    Err(error)=>{
+                        clear_slot(this);
+                        this.cleanup_wait_reason(&original.roots,&error,cx);
+                        if !observation {this.layout_notice("Natural-exit cleanup waiting",&error,window,cx);}
+                        return None;
+                    }
+                };
+                if observation && this.pending_close.is_some() {
+                    clear_slot(this);
+                    this.cleanup_wait_reason(&plan.roots,"Waiting for your current close to finish; this pane is preserved.",cx);
+                    return None;
+                }
+                if plan.expected.iter().any(|i|this.close_holds.contains(&i.address)) {
+                    clear_slot(this);
+                    this.cleanup_wait_reason(&plan.roots,"An uncertain original operation already owns this scope. Close the original pane to reconcile it.",cx);
+                    return None;
+                }
+                if original.expected.is_empty()
+                    && let Err(error)=close::save_pending(&file("close-pending"),&core_id,&plan) {
+                    clear_slot(this);this.cleanup_wait_reason(&plan.roots,&error,cx);return None;
+                }
+                this.natural_audit_attempted.extend(plan.roots.iter().cloned());
+                this.close_holds.extend(plan.expected.iter().map(|i|i.address.clone()));
+                this.retained_closes.insert(plan.operation_id.clone(),plan.clone());
+                if observation {this.observed_audit=Some(plan.clone());}
+                else {this.pending_close=Some(plan.clone());}
+                Some(plan)
+            }).ok().flatten();
+            let Some(plan)=plan else {return};
+            let work=plan.clone();
+            let result=cx.background_executor().spawn(async move {
+                work.reconcile_guarded(|params|core.call_timeout("terminal.close_reconcile",params,Duration::from_secs(300))
+                    .map_err(|error|close::CallFailure{kind:crate::hc::error_kind(&error).map(str::to_owned),message:format!("{error:#}")}))
+            }).await;
+            let _=this.update_in(cx,|this,window,cx| {
+                if observation {
+                    if this.observed_audit.as_ref().is_some_and(|p|p.operation_id==plan.operation_id) {this.observed_audit=None;}
+                } else if this.pending_close.as_ref().is_some_and(|p|p.operation_id==plan.operation_id) {this.pending_close=None;}
+                if this.core.hello["core"]["id"].as_str()!=Some(core_id.as_str()) {return}
+                let reason=match &result {
+                    Ok(close::Resolution::Closed(_))=>"Cleanup verified; waiting for the current close to finish.".to_owned(),
+                    Ok(close::Resolution::Cancelled)=>"Audit approval is not ready. Complete the required report/review, then close this pane to retry.".to_owned(),
+                    Err(error)=>format!("Audit could not complete: {error}. The original operation is preserved."),
+                };
+                this.cleanup_wait_reason(&plan.roots,&reason,cx);
+                if observation {
+                    this.observed_completion=Some((plan,result,generation));
+                    this.finish_observed_audit(window,cx);
+                } else if !this.draining && generation==this.core_generation {
+                    this.complete_close_request(&plan,result,true,false,window,cx);
+                }
+            });
         }).detach();
     }
 
@@ -2662,9 +3103,13 @@ impl AppWindow {
     fn run(&mut self, name: &str, args: Value, window: &mut Window, cx: &mut Context<Self>) {
         // A click or key has nobody to read the reply: show why it failed.
         if let Some(error) = self.run_as(name, args, true, window, cx).get("error").and_then(Value::as_str) {
-            let spec = json!({"kind":"toast", "notification":{"title":format!("{name} failed"),"body":error,"level":"error"}});
-            self.open_overlay(mods::new_overlay_id(), spec, window, cx);
+            self.command_error(name, error, window, cx);
         }
+    }
+
+    fn command_error(&mut self, name: &str, error: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let spec = json!({"kind":"toast", "notification":{"title":format!("{name} failed"),"body":error,"level":"error"}});
+        self.open_overlay(mods::new_overlay_id(), spec, window, cx);
     }
 
     /// Runs a command and says what it made or why not. Scripts and agents
@@ -2737,6 +3182,10 @@ impl AppWindow {
             && let Some(space) = Self::arg(&args, "id").and_then(|id| self.model.space_of(id))
             && let Err(error) = self.require_document(space.machine.as_deref())
         { return json!({"error":error}); }
+        if self.automatic_close_pending && close::selection_command(name) { return json!({"error":"automatic close pending; selection is held"}); }
+        if self.pending_close.is_some() && close::structural_command(name) {
+            return json!({"error":"guarded close pending; structural changes are held"});
+        }
         self.reply = None;
         self.dispatch(name, &args, person, window, cx);
         self.flush_documents(false, window, cx);
@@ -2781,6 +3230,9 @@ impl AppWindow {
                 let Some(id) = Self::owned(a, "id").or_else(|| self.model.active.clone()) else { return self.fail("no space to close") };
                 let Some(p) = self.model.space(&id) else { return self.fail(format!("no space {id:?}")) };
                 if a.get("confirmed").and_then(Value::as_bool) != Some(true) {
+                    if a.get("close_context").is_some_and(|v| !v.is_null()) {
+                        return self.fail("automatic close cannot bypass last-space confirmation");
+                    }
                     if !person {
                         return self.fail("space.close ends its terminals: pass confirmed: true");
                     }
@@ -2789,8 +3241,7 @@ impl AppWindow {
                     self.confirm("Close space?", &detail, "space.close", json!({ "id": id, "confirmed": true }), window, cx);
                     return;
                 }
-                let addrs = self.model.remove_space(&id);
-                self.kill(&addrs, cx);
+                return self.begin_close(close::Target::Space(id), a.get("close_context").cloned().unwrap_or(Value::Null), window, cx);
             }
             "space.rename" => {
                 let Some(id) = Self::owned(a, "id").or_else(|| self.model.active.clone()) else { return self.fail("no space to rename") };
@@ -2839,10 +3290,10 @@ impl AppWindow {
                 if p.tabs.len() == 1 {
                     let mut args = json!({ "id": p.id });
                     args["confirmed"] = a.get("confirmed").cloned().unwrap_or(Value::Null);
+                    args["close_context"] = a.get("close_context").cloned().unwrap_or(Value::Null);
                     return self.dispatch("space.close", &args, person, window, cx);
                 }
-                let (addrs, _) = self.model.remove_tab(&id);
-                self.kill(&addrs, cx);
+                return self.begin_close(close::Target::Tab(id), a.get("close_context").cloned().unwrap_or(Value::Null), window, cx);
             }
             "tab.rename" => {
                 let Some(id) = Self::owned(a, "id").or(active_ctx) else { return self.fail("no tab to rename") };
@@ -2908,11 +3359,9 @@ impl AppWindow {
                 }
                 if c.root.panes().len() == 1 {
                     let id = c.id.clone();
-                    return self.dispatch("tab.close", &json!({ "id": id }), person, window, cx);
+                    return self.dispatch("tab.close", &json!({ "id": id, "close_context":a.get("close_context").cloned().unwrap_or(Value::Null) }), person, window, cx);
                 }
-                let addr = self.model.address_of(&pane);
-                self.model.remove_pane(&pane);
-                self.kill(&addr.into_iter().collect::<Vec<_>>(), cx);
+                return self.begin_close(close::Target::Pane(pane), a.get("close_context").cloned().unwrap_or(Value::Null), window, cx);
             }
             "pane.zoom" => {
                 let pane = Self::owned(a, "pane").or_else(|| self.model.focused_pane());
@@ -2933,7 +3382,7 @@ impl AppWindow {
                     self.focused_block = None;
                     self.focused_pane = Some(id.clone());
                     self.synced_model_pane = self.model.focused_pane();
-                    if !self.overlays.iter().any(|o| o.kind.modal_keys()) && let Some(f) = self.pane_focus(&id) {
+                    if !self.overlays.iter().any(|o| o.kind.modal_keys()) && let Some(f) = self.pane_focus(&id, cx) {
                         f.focus(window, cx);
                     }
                     self.publish(cx);
@@ -3010,7 +3459,7 @@ impl AppWindow {
                     Some("menu") => "",
                     other => return self.fail(format!("terminal.right_click to is \"program\" or \"menu\", not {other:?}")),
                 };
-                let t = Self::owned(a, "terminal").or_else(|| self.focused_terminal(window).map(|t| t.address.clone()));
+                let t = Self::owned(a, "terminal").or_else(|| self.focused_terminal(window, cx).map(|t| t.address.clone()));
                 let Some(t) = t.filter(|t| self.live.contains_key(t)) else { return self.fail("no such running terminal") };
                 // Off the UI thread: a terminal on a slow machine answers late.
                 let core = self.core.clone();
@@ -3039,12 +3488,21 @@ impl AppWindow {
                     })
                     .detach();
             }
+            "app.close_evidence_reload" => {
+                let result=self.reload_close_evidence().map(|_|json!({"ok":true}));
+                self.answer(result);
+            }
+            "terminal.close_reconcile" => {
+                let op=Self::arg(a,"operation_id").unwrap_or_default();
+                let Some(plan)=self.retained_closes.get(op).cloned() else { return self.fail("no retained close operation"); };
+                return self.begin_close_request(plan.target.clone(),Value::Null,Some(plan),window,cx);
+            }
             "terminal.kill" => {
                 let t = Self::arg(a, "terminal").unwrap_or_default();
-                if !self.live.contains_key(t) {
-                    return self.fail(format!("no running terminal {t:?}"));
+                if !self.live.contains_key(t) && !self.retained_closes.values().any(|p|p.target==close::Target::Terminal(t.to_owned())) {
+                    return self.fail(format!("no running terminal or retained close {t:?}"));
                 }
-                self.kill(&[t.to_owned()], cx);
+                return self.begin_close(close::Target::Terminal(t.to_owned()), Value::Null, window, cx);
             }
             "terminal.peek" => {
                 let t = Self::arg(a, "terminal").unwrap_or_default();
@@ -3074,8 +3532,13 @@ impl AppWindow {
                     self.focused_pane = None;
                 }
             }
+            "terminal.search" => {
+                let Some(t) = self.focused_terminal(window, cx) else { return self.fail("no focused terminal to search") };
+                t.view.update(cx, |view, cx| view.open_search(window, cx));
+                return;
+            }
             "terminal.copy" | "terminal.paste" | "terminal.paste_image" => {
-                if let Some(t) = self.focused_terminal(window) {
+                if let Some(t) = self.focused_terminal(window, cx) {
                     t.view.update(cx, |v, cx| match name {
                         "terminal.paste" => v.paste(cx),
                         "terminal.paste_image" => v.paste_image(cx),
@@ -3084,6 +3547,11 @@ impl AppWindow {
                     });
                 }
                 return;
+            }
+            "terminal.scroll" => {
+                if let Err(error) = self.scroll_terminal(a, window, cx) {
+                    self.fail(error);
+                }
             }
             // ---- agents
             "agent.focus" => {
@@ -3358,6 +3826,7 @@ impl AppWindow {
 
     /// `pane.go`: the nearest pane or focusable mod.
     fn go(&mut self, dir: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.automatic_close_pending { return; }
         let Some(from) = self.focused_block.clone().or_else(|| self.model.focused_pane()) else { return };
         let Some(to) = self.neighbor(&from, dir, true) else { return };
         if self.focusable(&to) {
@@ -3371,6 +3840,7 @@ impl AppWindow {
 
     /// Until the mod takes the keyboard, the window holds the keys.
     fn focus_block(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.automatic_close_pending { return; }
         if self.model.tab_of(id).is_some() {
             self.model.focus_pane(id);
             self.focused_pane = None;
@@ -3859,7 +4329,7 @@ impl AppWindow {
 
     // ---- rendering ---------------------------------------------------------
 
-    fn focused_path(&self, window: &Window) -> HashSet<String> {
+    fn focused_path(&self, window: &Window, cx: &App) -> HashSet<String> {
         let mut out = HashSet::new();
         // A mod block in the layout holding the keyboard: its `focus` looks, not the pane's.
         if let Some(path) = self.focused_block.as_ref().and_then(|b| self.chrome.path_to(b)) {
@@ -3868,7 +4338,7 @@ impl AppWindow {
         }
         if let Some(p) = &self.focused_pane {
             // Pane selection survives an input, float or dialog taking the keyboard.
-            if self.pane_focus(p).is_some_and(|f| !f.is_focused(window)) {
+            if self.pane_term(p).is_some_and(|t| !t.view.read(cx).owns_keyboard_focus(window, cx)) {
                 return out;
             }
             if let Some(c) = self.model.active_tab()
@@ -3991,12 +4461,13 @@ impl AppWindow {
 
     fn render_block(&self, n: &Node, content: &Content, focused: &HashSet<String>, cx: &mut Context<Self>) -> AnyElement {
         match content {
-            Content::Terminal { .. } => match self.pane_term(&n.id) {
+            Content::Terminal { terminal: address } => match self.pane_term(&n.id) {
                 Some(t) => {
                     let id = n.id.clone();
                     div()
-                        .size_full()
+                        .size_full().flex().flex_col()
                         .on_any_mouse_down(cx.listener(move |this, _, _, cx| {
+                            if this.automatic_close_pending { cx.stop_propagation(); return; }
                             // Overlay terminals keep their own focus; chrome blocks share the pane focus API.
                             if this.focused_pane.as_deref() != Some(id.as_str())
                                 && (this.model.tab_of(&id).is_some() || terminal_block(&this.chrome, Some(&id)).is_some())
@@ -4009,10 +4480,11 @@ impl AppWindow {
                                 cx.notify();
                             }
                         }))
-                        .child(shown_terminal(&t.view, cx))
+                        .children(self.cleanup_wait_banner(address))
+                        .child(div().flex_1().min_h_0().child(shown_terminal(&t.view, cx)))
                         .into_any_element()
                 }
-                None => div().into_any_element(),
+                None => div().size_full().flex().flex_col().children(self.cleanup_wait_banner(address)).into_any_element(),
             },
             Content::Mod { .. } => self.render_slot(&n.id, cx),
             Content::Agent { .. } => match self.shown_agent() {
@@ -4059,6 +4531,7 @@ impl AppWindow {
                 .when(in_pane, |d| {
                     let id = slot.to_owned();
                     d.on_any_mouse_down(cx.listener(move |this, _, _, cx| {
+                        if this.automatic_close_pending { cx.stop_propagation(); return; }
                         if this.focused_pane.as_deref() != Some(id.as_str()) {
                             this.model.focus_pane(&id);
                             this.focused_pane = Some(id.clone());
@@ -4072,17 +4545,7 @@ impl AppWindow {
                 // or other focusable control owns the keyboard once it takes focus.
                 .when(!in_overlay && !in_pane, |d| {
                     d.capture_any_mouse_down(cx.listener(|_, _, window, cx| {
-                        cx.defer_in(window, |this, window, cx| {
-                            let dialog = this.overlays.iter().any(|o| o.kind.modal_keys());
-                            if !dialog
-                                && this.focused_block.is_none()
-                                && (window.focused(cx).is_none() || this.focus.is_focused(window))
-                                && let Some(f) = this.focused_pane.as_ref().and_then(|p| this.pane_focus(p))
-                                && !f.is_focused(window)
-                            {
-                                f.focus(window, cx);
-                            }
-                        });
+                        cx.defer_in(window, |this, window, cx| this.refocus_pane(window, cx));
                     }))
                 })
                 // Popups size to their content, up to the window: a column, so a mod
@@ -4732,10 +5195,10 @@ impl Render for AppWindow {
             .iter()
             .find(|(_, t)| t.focus.is_focused(window))
             .map(|(id, _)| id.clone());
-        if clicked.is_some() && self.focused_block.take().is_some() {
+        if !self.automatic_close_pending && clicked.is_some() && self.focused_block.take().is_some() {
             self.publish(cx);
         }
-        if let Some(id) = clicked
+        if !self.automatic_close_pending && let Some(id) = clicked
             && self.focused_pane.as_deref() != Some(id.as_str())
             && (self.model.tab_of(&id).is_some() || terminal_block(&self.chrome, Some(&id)).is_some())
         {
@@ -4749,7 +5212,7 @@ impl Render for AppWindow {
         if mods::publish_window(self.window_json(window)) {
             self.refresh_snapshot_mods(cx);
         }
-        let focused = self.focused_path(window);
+        let focused = self.focused_path(window, cx);
         let tree = self.render_node(&self.chrome, &focused, None, cx);
         let tree = self.window_frame(tree, window, cx);
         let overlays = self.render_overlays(window.viewport_size(), cx);
@@ -4776,6 +5239,19 @@ impl Render for AppWindow {
                 }
                 this.run_action(a.id(), w, cx);
             }))
+            .on_action(cx.listener(|this, a: &crate::keys::CommandBinding, w, cx| {
+                match a.command() {
+                    Ok((name, args)) => {
+                        #[cfg(target_os = "macos")]
+                        if let Some(action) = crate::macos::action(&name) {
+                            w.dispatch_action(action, cx);
+                            return;
+                        }
+                        this.run(&name, args, w, cx);
+                    }
+                    Err(error) => this.command_error("Key binding", &error, w, cx),
+                }
+            }))
             // Ctrl (Cmd) alone shows links in the pane under the pointer, focused or not.
             .on_modifiers_changed(cx.listener(|this, _: &ModifiersChangedEvent, _, cx| {
                 for t in this.terms.values() {
@@ -4790,7 +5266,10 @@ impl Render for AppWindow {
                     cx.stop_propagation();
                 }
             }))
-            .capture_any_mouse_down(cx.listener(|this, ev: &MouseDownEvent, _, _| this.pointer = ev.position))
+            .capture_any_mouse_down(cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                if !this.close_mouse_allowed(ev.position) { cx.stop_propagation(); return; }
+                this.pointer=ev.position;
+            }))
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
                 this.drag_window(ev, window);
                 if this.drag.is_none() {
@@ -5194,6 +5673,206 @@ mod tests {
     }
 
     #[test]
+    fn showing_the_tab_again_gives_its_pane_the_keyboard() {
+        in_own_process("tab_shown_again");
+    }
+
+    /// A home page in a stack beside the tab: a space made while it shows
+    /// gets the keyboard once `layout.select` shows the tab again.
+    #[gpui::test]
+    fn tab_shown_again(cx: &mut gpui::TestAppContext) {
+        use serde_json::json;
+        if !running_alone("tab_shown_again") {
+            return;
+        }
+        let (view, cx) = open_window(cx, "home", "", json!({
+            "id": "center", "type": "stack", "active": "main", "children": [
+                { "id": "main", "type": "block", "content": { "tab": "active" } },
+                { "id": "home", "type": "block", "content": { "mod": "home" } }
+            ]
+        }));
+        let select = |child: &str, cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| view.update(cx, |this, cx| this.run("layout.select", json!({ "stack": "center", "child": child }), window, cx)));
+            cx.run_until_parked();
+        };
+        select("home", cx);
+        cx.update(|window, cx| view.update(cx, |this, cx| {
+            this.model.add_space("sp1", "", "/tmp", crate::model::Tab::new("tb1", "", "p1", "t1"));
+            this.sync(window, cx);
+        }));
+        cx.run_until_parked();
+        let pane_focused = |cx: &mut gpui::VisualTestContext| cx.update(|window, cx| view.read(cx).pane_focus("p1", cx).unwrap().is_focused(window));
+        assert!(!pane_focused(cx), "hidden, the pane can't hold the keyboard");
+        select("main", cx);
+        assert!(pane_focused(cx));
+    }
+
+    #[test]
+    fn automatic_close_keeps_selection_until_native_outcome() {
+        in_own_process("close_selection_gate");
+    }
+
+    #[gpui::test]
+    fn close_selection_gate(cx: &mut gpui::TestAppContext) {
+        use serde_json::json;
+        use super::close;
+        if !running_alone("close_selection_gate") { return; }
+        let (view,cx)=open_window(cx,"unused","",json!({
+            "id":"main","type":"block","content":{"tab":"active"}
+        }));
+        cx.update(|window,cx|view.update(cx,|this,cx| {
+            this.model.add_space("s1","one","",crate::model::Tab::new("tb1","","p1","t1"));
+            this.model.add_tab("s1",crate::model::Tab::new("tb2","","p2","t2"));
+            this.model.add_space("s2","two","",crate::model::Tab::new("tb3","","p3","t3"));
+            this.model.focus_pane("p1");
+            this.live=[("t1",1),("t2",2),("t3",3)].into_iter().map(|(address,pid)|
+                (address.into(),json!({"address":address,"pid":pid,"created_ms":100+pid,"labels":{}}))).collect();
+            let plan=close::Plan::capture(close::Target::Tab("tb2".into()),&this.model,&this.live).unwrap();
+            this.pending_close=Some(plan);
+            this.automatic_close_pending=true;
+            this.focused_pane=Some("p1".into());
+            this.bounds.borrow_mut().insert("p1".into(),gpui::Bounds::new(gpui::point(gpui::px(0.),gpui::px(0.)),gpui::size(gpui::px(100.),gpui::px(100.))));
+            assert!(this.close_mouse_allowed(gpui::point(gpui::px(50.),gpui::px(50.))));
+            assert!(!this.close_mouse_allowed(gpui::point(gpui::px(150.),gpui::px(50.))));
+
+            let slot=this.documents.get_mut("").unwrap();
+            slot.available=true;
+            slot.document=Some(crate::mirror::Document::capture(&this.model,None));
+            let snapshot=|m:&crate::model::Model|json!({
+                "document":crate::mirror::Document::capture(m,None),
+                "view":crate::mirror::View::capture(m)
+            });
+            let before=snapshot(&this.model);
+            for (command,args) in [
+                ("pane.focus",json!({"pane":"p2"})),("agent.focus",json!({"terminal":"t2"})),
+                ("space.select",json!({"id":"s2"})),("tab.select",json!({"id":"tb2"})),
+                ("tab.move",json!({"id":"tb2","index":1})),("pane.swap",json!({"direction":"right"})),
+            ] {
+                let reply=this.run_as(command,args,true,window,cx);
+                assert!(reply["error"].as_str().is_some_and(|e|e.contains("held")),"{command}: {reply}");
+                assert_eq!(snapshot(&this.model),before,"{command} changed the model before native outcome");
+            }
+            this.focus_agent("t2");
+            this.focus_block("p2",window,cx);
+            this.go("right",window,cx);
+            assert_eq!(snapshot(&this.model),before,"internal focus path bypassed automatic hold");
+            assert!(!this.documents_updated(None,vec![(String::new(),crate::mirror_sync::Outcome::Read(crate::mirror::Document::default(),99))],window,cx));
+            assert_eq!(snapshot(&this.model),before,"a mirrored update changed selection before outcome");
+            assert_eq!(this.close_deferred_documents.len(),1);
+            // Manual close still holds structure, while allowing the person to focus.
+            this.automatic_close_pending=false;
+            assert!(this.close_mouse_allowed(gpui::point(gpui::px(150.),gpui::px(50.))));
+            let reply=this.run_as("pane.focus",json!({"pane":"p2"}),true,window,cx);
+            assert!(reply.get("error").is_none(),"{reply}");
+            assert_eq!(this.model.focused_pane().as_deref(),Some("p2"));
+            let after_focus=snapshot(&this.model);
+            let reply=this.run_as("tab.move",json!({"id":"tb2","index":1}),true,window,cx);
+            assert!(reply["error"].as_str().is_some_and(|e|e.contains("held")));
+            assert_eq!(snapshot(&this.model),after_focus);
+            this.pending_close=None;
+        }));
+    }
+
+    #[test]
+    fn observed_audit_reports_failure_without_locking_manual_commands() {
+        in_own_process("observed_audit_slot");
+    }
+
+    #[gpui::test]
+    fn observed_audit_slot(cx: &mut gpui::TestAppContext) {
+        use serde_json::json;
+        use super::close;
+        if !running_alone("observed_audit_slot") {return}
+        let (view,cx)=open_window(cx,"unused","",json!({"id":"main","type":"block","content":{"tab":"active"}}));
+        cx.update(|window,cx|view.update(cx,|this,cx| {
+            let mut core=crate::hc::offline();
+            std::sync::Arc::get_mut(&mut core).unwrap().hello=json!({"core":{"id":"cleanup-fixture"}});
+            this.core=core;
+            this.model.add_space("s1","","",crate::model::Tab::new("tb1","","p1","t1"));
+            this.model.split("p1",crate::layout::Axis::Row,"p2","t2");
+            this.model.add_tab("s1",crate::model::Tab::new("tb2","","p3","t3"));
+            this.model.focus_pane("p2");
+            this.live=[("t2",2),("t3",3)].into_iter().map(|(address,pid)|
+                (address.into(),json!({"address":address,"pid":pid,"created_ms":100+pid,"labels":{}}))).collect();
+            this.documents.get_mut("").unwrap().available=true;
+            // The offline core refuses before any operation starts, but the
+            // reason is visible in the pane and repeated polls are backed off.
+            this.begin_natural_audit(close::Target::Terminal("t1".into()),true,window,cx);
+            assert!(this.pending_close.is_none());
+            assert!(this.observed_audit.is_none());
+            assert!(this.cleanup_wait_banner("t1").is_some());
+            let state=this.natural_audit_status.get("t1").unwrap();
+            assert!(state.message().contains("core does not support"));
+            let retry_check=std::time::Instant::now();
+            assert!(!state.ready(retry_check+std::time::Duration::from_secs(29)));
+            assert!(state.ready(retry_check+std::time::Duration::from_secs(31)));
+            this.begin_natural_audit(close::Target::Terminal("t1".into()),true,window,cx);
+            assert!(this.natural_audit_status["t1"].ready(retry_check+std::time::Duration::from_secs(31)));
+
+            let observed=close::Plan::audit_draft(close::Target::Terminal("t1".into()),&this.model).unwrap();
+            let observed_id=observed.operation_id.clone();
+            this.observed_audit=Some(observed.clone());
+            this.close_holds.insert("t1".into());
+            let reply=this.run_as("tab.move",json!({"id":"tb2","index":1}),false,window,cx);
+            assert!(reply.get("error").is_none(),"{reply}");
+            let reply=this.run_as("pane.focus",json!({"pane":"p3"}),false,window,cx);
+            assert!(reply.get("error").is_none(),"{reply}");
+            let split=this.run_as("pane.split",json!({"pane":"p3","direction":"right","mod":"unused"}),false,window,cx);
+            assert!(split.get("error").is_none(),"{split}");
+            let added=split["pane"].as_str().unwrap().to_owned();
+            let closed=this.run_as("pane.close",json!({"pane":added}),false,window,cx);
+            assert!(closed.get("error").is_none(),"{closed}");
+            assert!(this.model.tab_of(&added).is_none(),"an unrelated mod-only close completes immediately");
+            // The offline fixture deliberately refuses native kills. The real
+            // terminal path must still reach that compatibility gate, rather
+            // than being refused by the observed-audit foreground slot.
+            let terminal=this.run_as("terminal.kill",json!({"terminal":"t3"}),false,window,cx);
+            assert!(terminal["error"].as_str().is_some_and(|e|e.contains("core does not support")),"{terminal}");
+            let reply=this.run_as("pane.close",json!({"pane":"p1"}),false,window,cx);
+            assert_eq!(reply["operation_id"],observed_id,"same-pane close must join, not create a second operation");
+            assert_eq!(reply["pending"],true);
+            assert!(this.pending_close.is_none(),"an observation must not take the person's structural lock");
+            assert_eq!(this.model.address_of("p1").as_deref(),Some("t1"));
+
+            // A late observed result cannot clear a person's newer pending
+            // operation or mutate its model while that transaction is pending.
+            let human=close::Plan::capture(close::Target::Pane("p3".into()),&this.model,&this.live).unwrap();
+            let human_id=human.operation_id.clone();
+            this.pending_close=Some(human);
+            this.observed_audit=None;
+            this.close_holds.insert("t1".into());
+            this.observed_completion=Some((observed,Err("helper audit denied; original operation preserved".into()),this.core_generation));
+            this.finish_observed_audit(window,cx);
+            assert_eq!(this.pending_close.as_ref().unwrap().operation_id,human_id);
+            assert!(this.observed_completion.is_some());
+            assert_eq!(this.model.address_of("p1").as_deref(),Some("t1"));
+            this.pending_close=None;
+            this.finish_observed_audit(window,cx);
+            assert!(this.close_holds.contains("t1"),"unknown audit must retain its hold");
+            assert_eq!(this.model.address_of("p1").as_deref(),Some("t1"));
+            assert!(this.cleanup_wait_banner("t1").is_some());
+            // A retry replaces the refusal with a progress reason, and only
+            // an exact audited receipt removes that reason and the old pane.
+            this.cleanup_wait_reason(&["t1".into()],"Checking cleanup evidence.",cx);
+            assert!(this.natural_audit_status["t1"].message().contains("Checking"));
+            let mut draft=close::Plan::audit_draft(close::Target::Terminal("t1".into()),&this.model).unwrap();
+            draft.operation_id=observed_id;
+            let verified=draft.audit_snapshot("cleanup-fixture",json!({
+                "core_id":"cleanup-fixture","roots":["t1"],
+                "expected":[{"address":"t1","pid":1,"created_ms":101}],"operations":[],
+                "targets":[{"address":"t1","pid":1,"created_ms":101,"input_generation":7,
+                    "program_started_ms":100,"turn":2,"native_state":"finished","observed_exit":true}]
+            })).unwrap();
+            close::save_pending(&super::file("close-pending"),"cleanup-fixture",&verified).unwrap();
+            let receipt=verified.completed(verified.expected.clone()).unwrap();
+            this.complete_close_request(&verified,Ok(close::Resolution::Closed(receipt)),true,true,window,cx);
+            assert!(this.cleanup_wait_banner("t1").is_none());
+            assert!(this.model.pane_of("t1").is_none());
+            assert!(this.model.pane_of("t2").is_some());
+        }));
+    }
+
+    #[test]
     fn pane_ring_follows_keyboard_focus() {
         in_own_process("pane_ring_focus");
     }
@@ -5208,19 +5887,71 @@ mod tests {
         }));
         cx.update(|window, cx| view.update(cx, |this, cx| {
             this.focused_pane = Some("pane".into());
-            let pane = this.pane_focus("pane").unwrap();
+            let pane = this.pane_focus("pane", cx).unwrap();
             pane.focus(window, cx);
-            assert!(this.focused_path(window).contains("pane"));
+            assert!(this.focused_path(window, cx).contains("pane"));
             let input = cx.focus_handle();
             input.focus(window, cx);
-            assert!(this.focused_path(window).is_empty());
+            assert!(this.focused_path(window, cx).is_empty());
             assert_eq!(this.focused_pane.as_deref(), Some("pane"));
             pane.focus(window, cx);
-            assert!(this.focused_path(window).contains("pane"));
+            assert!(this.focused_path(window, cx).contains("pane"));
         }));
         cx.deactivate_window();
+        cx.update(|window, cx| view.update(cx, |this, cx| {
+            assert!(this.focused_path(window, cx).contains("pane"));
+        }));
+    }
+
+    #[test]
+    fn find_focus_survives_tab_and_space_switches() {
+        in_own_process("find_focus_switches");
+    }
+
+    #[gpui::test]
+    fn find_focus_switches(cx: &mut gpui::TestAppContext) {
+        use serde_json::json;
+        if !running_alone("find_focus_switches") {
+            return;
+        }
+        cx.update(gpui_base::init);
+        let (view, cx) = open_window(cx, "unused", "", json!({
+            "id": "main", "type": "block", "content": { "tab": "active" }
+        }));
+        cx.update(|window, cx| view.update(cx, |this, cx| {
+            this.model.add_space("s1", "one", "", crate::model::Tab::new("a", "a", "pa", "t1"));
+            this.model.add_tab("s1", crate::model::Tab::new("b", "b", "pb", "t2"));
+            this.model.add_space("s2", "two", "", crate::model::Tab::new("c", "c", "pc", "t3"));
+            this.model.select_tab("a");
+            this.sync(window, cx);
+            this.dispatch("terminal.search", &json!({}), true, window, cx);
+        }));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("n e e d l e");
+        for (action, args) in [
+            ("tab.select", json!({"id": "b"})),
+            ("tab.select", json!({"id": "a"})),
+            ("space.select", json!({"id": "s2"})),
+            ("space.select", json!({"id": "s1"})),
+        ] {
+            cx.update(|window, cx| view.update(cx, |this, cx| {
+                this.dispatch(action, &args, true, window, cx);
+            }));
+            cx.run_until_parked();
+            if args["id"] == "a" || args["id"] == "s1" {
+                cx.update(|window, cx| view.update(cx, |this, cx| {
+                    let term = this.pane_term("pa").unwrap();
+                    assert!(!term.focus.is_focused(window), "returning must not send a find query to the program");
+                    assert!(this.pane_focus("pa", cx).unwrap().is_focused(window));
+                    assert!(this.focused_path(window, cx).contains("pa"), "Find focus must keep the pane ring");
+                }));
+                cx.simulate_keystrokes("x");
+            }
+        }
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
         cx.update(|window, cx| view.update(cx, |this, _| {
-            assert!(this.focused_path(window).contains("pane"));
+            assert!(this.pane_term("pa").unwrap().focus.is_focused(window));
         }));
     }
 
@@ -5508,6 +6239,136 @@ export default class Header extends View {
             .map(|n| (n.id.clone(), fresh.address_of(&n.id).unwrap())).collect();
         assert_eq!(reloaded, panes);
         assert_eq!(panes, [("x3".to_owned(), "t3".to_owned()), ("x2".into(), "t2".into()), ("x1".into(), "t1".into())]);
+    }
+
+    /// A guarded close holds pane moves like any structural change: pane.move,
+    /// a grip or header drag started while the close is pending, and a drag
+    /// that was already under way when the close began all leave the tree, the
+    /// pane and terminal identities and the saved layout as they were.
+    #[test]
+    fn guarded_close_holds_pane_moves() {
+        in_own_process("pane_drag_close_hold");
+    }
+
+    #[gpui::test]
+    fn pane_drag_close_hold(cx: &mut gpui::TestAppContext) {
+        use super::close;
+        use crate::{layout::Axis, model::Tab};
+        use gpui::{Modifiers, MouseButton, MouseMoveEvent, point, px};
+        use serde_json::json;
+        if !running_alone("pane_drag_close_hold") {
+            return;
+        }
+        let header = r#"import { View, div } from "gpui-kit";
+
+export default class Header extends View {
+  render() { return div().size_full(); }
+}
+"#;
+        let layout = json!({ "id": "root", "type": "block", "content": { "tab": "active", "pane": {
+            "header": { "content": { "mod": "pane-header" }, "height": 30, "position": "top", "reveal": "always" } } } });
+        let (view, cx) = open_window(cx, "pane-header", header, layout);
+        cx.update(|window, cx| view.update(cx, |this, cx| {
+            this.model.add_space("p1", "s", "/tmp", Tab::new("c1", "1", "x1", "t1"));
+            assert!(this.model.split("x1", Axis::Row, "x2", "t2"));
+            assert!(this.model.split("x2", Axis::Row, "x3", "t3"));
+            this.live = [("t1", 1), ("t2", 2), ("t3", 3)].into_iter().map(|(address, pid)|
+                (address.into(), json!({"address": address, "pid": pid, "created_ms": 100 + pid, "labels": {}}))).collect();
+            let slot = this.documents.entry(String::new()).or_default();
+            slot.available = true;
+            this.sync(window, cx);
+            let saved = crate::mirror::Document::capture(&this.model, None);
+            this.documents.get_mut("").unwrap().document = Some(saved);
+        }));
+        let settle = |cx: &mut gpui::VisualTestContext| {
+            for _ in 0..3 {
+                cx.update(|window, _| window.refresh());
+                cx.executor().advance_clock(std::time::Duration::from_millis(500));
+                cx.run_until_parked();
+            }
+        };
+        settle(cx);
+        // The tree, who is where, and what the machine's document holds.
+        let state = |cx: &mut gpui::VisualTestContext| view.update(cx, |this, _| json!({
+            "tree": format!("{:?}", this.model.spaces),
+            "panes": this.model.active_tab().unwrap().root.panes().iter()
+                .map(|n| (n.id.clone(), this.model.address_of(&n.id).unwrap())).collect::<Vec<_>>(),
+            "document": crate::mirror::Document::capture(&this.model, None),
+            "view": crate::mirror::View::capture(&this.model),
+            "saved": this.documents[""].document,
+        }));
+        let at = |cx: &mut gpui::VisualTestContext, address: &str, header: bool| view.update(cx, |this, _| {
+            let b = *this.bounds.borrow().get(&this.model.pane_of(address).unwrap()).unwrap();
+            if header { point(b.left() + px(80.), b.top() + px(10.)) } else { b.center() }
+        });
+        let press = |cx: &mut gpui::VisualTestContext, grip: bool| {
+            let from = at(cx, "t3", true);
+            if grip {
+                cx.update(|_, cx| view.update(cx, |this, cx| this.pane_press("x3", from, true, cx)));
+            } else {
+                cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::none());
+            }
+        };
+        let drag = |cx: &mut gpui::VisualTestContext| {
+            let to = at(cx, "t1", false);
+            cx.simulate_event(MouseMoveEvent { position: to, pressed_button: Some(MouseButton::Left), modifiers: Modifiers::none() });
+            cx.run_until_parked();
+        };
+        let release = |cx: &mut gpui::VisualTestContext| {
+            let to = at(cx, "t1", false);
+            cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
+            settle(cx);
+        };
+        let dragging = |cx: &mut gpui::VisualTestContext| view.update(cx, |this, _| this.pane_drag.is_some());
+        // Closing x2, the pane between the one dragged and its target.
+        let hold = |cx: &mut gpui::VisualTestContext, automatic: bool| view.update(cx, |this, _| {
+            this.pending_close = Some(close::Plan::capture(close::Target::Pane("x2".into()), &this.model, &this.live).unwrap());
+            this.automatic_close_pending = automatic;
+        });
+        let release_hold = |cx: &mut gpui::VisualTestContext| view.update(cx, |this, _| {
+            this.pending_close = None;
+            this.automatic_close_pending = false;
+        });
+        let pane_move = |cx: &mut gpui::VisualTestContext, person: bool| cx.update(|window, cx| view.update(cx, |this, cx|
+            this.run_as("pane.move", json!({ "pane": "x3", "to": "x1" }), person, window, cx)));
+        let before = state(cx);
+
+        for automatic in [false, true] {
+            hold(cx, automatic);
+            for person in [true, false] {
+                let reply = pane_move(cx, person);
+                assert!(reply["error"].as_str().is_some_and(|e| e.contains("held")), "automatic {automatic} person {person}: {reply}");
+                assert_eq!(state(cx), before, "automatic {automatic} person {person}");
+            }
+            // A drag can't start while the close is pending.
+            for grip in [false, true] {
+                press(cx, grip);
+                drag(cx);
+                assert!(!dragging(cx), "automatic {automatic} grip {grip}");
+                release(cx);
+                assert_eq!(state(cx), before, "automatic {automatic} grip {grip}");
+            }
+            release_hold(cx);
+        }
+
+        // A drag under way when the close begins drops nothing.
+        for grip in [false, true] {
+            press(cx, grip);
+            drag(cx);
+            assert!(dragging(cx), "grip {grip}");
+            hold(cx, false);
+            release(cx);
+            assert!(!dragging(cx), "grip {grip}");
+            assert_eq!(state(cx), before, "grip {grip}");
+            release_hold(cx);
+        }
+
+        // Once the close is resolved the same drag moves the pane, so the checks above aren't vacuous.
+        press(cx, false);
+        drag(cx);
+        release(cx);
+        let after = state(cx);
+        assert_eq!(after["panes"], json!([["x3", "t3"], ["x2", "t2"], ["x1", "t1"]]));
     }
 
     /// Mods see window().active follow the focus, losing it too: a probe mod

@@ -332,6 +332,10 @@ layout's look and a block can differ:
   folder (or the home's `fonts/`) load at start and on the next look change,
   so a layout and its mod folder travel together (Herdr 98's do: its pixel
   fonts are in `mods/win98/fonts/`).
+- `pane_scrollbars` in settings.json (default `true`): show terminal scrollback
+  with a slim thumb and track. Drag the thumb or click the track to jump there.
+  With little or no terminal padding, the hit lane overlays the last 8px;
+  terminal columns do not change. Hidden in alternate-screen programs.
 - `terminal_opacity` (0..1): below 1, the background behind a terminal
   (a pane frame's, the layout's gradient) shows through its text.
 - Switching layouts switches the look. The theme menu changes the shown
@@ -470,6 +474,10 @@ the build doesn't do.
 
 ## Keys: `keys.json`
 
+On upgrade, an untouched keys file from an earlier release gets the current
+shortcuts. Any edit, even whitespace, keeps the entire file as yours; new default
+shortcuts must then be added by hand.
+
 ```json
 {
   "global":   { "ctrl-shift-t": "tab.new", "ctrl-shift-o": "pane.split:right", "alt-1": "space.select:1" },
@@ -486,6 +494,14 @@ the build doesn't do.
   command's first argument), `send:<text>` (types into the terminal),
   `<mod>.<command>` (delivered to that mod's `nextCommand()`), or `terminal`
   (the program gets the key).
+- Named, typed command arguments use an object instead of a string:
+  `"ctrl-shift-r": {"command": "layout.resize", "args": {"id": "sidebar", "px": 240}}`.
+  `command` names an app command; `args` is an object (optional, defaults to `{}`).
+  It can pass several arguments, numbers, booleans, arrays or nested objects.
+  String actions keep their literal first-argument shorthand, including numeric
+  indexes: `space.new:{work}` names a space `{work}`, and `space.new:{}` names it `{}`.
+  Invalid binding objects or rejected arguments show an error toast when pressed;
+  the key does not go to the terminal program.
 - Plain ctrl+letters go to the program unless bound. Programs rely on
   ctrl+c, ctrl+d, ctrl+l, ctrl+r, ctrl+w, ctrl+a, ctrl+e, ctrl+u, ctrl+k,
   ctrl+z and ctrl+[ (Escape); ctrl+alt is AltGr on Windows; option+digits
@@ -500,8 +516,31 @@ the build doesn't do.
   Existing `keys.json` files don't need to change.
 - Terminal keys honor the program's negotiated Kitty mode, including on Windows.
 - Windows terminal Escape stays separate from the following key.
+- Search: `ctrl-shift-f` (Cmd-F on macOS) opens a find bar inside the focused terminal;
+  Enter/Shift-Enter moves through matches and Escape closes it while the find field
+  has focus. Clicking the terminal puts typing, including Escape, back in the program;
+  the bar and its matches stay.
+  Each terminal keeps its own query, and reopening selects it so typing replaces it. Search covers the screen and scrollback without replacing text selection.
 
 ## Commands
+
+In this local fork, space.close, tab.close, pane.close and terminal.kill submit
+one guarded core batch before changing the model. They can report `pending:
+true`; a later refusal is shown in the window and keeps its session layout.
+Unsupported cores, unverifiable identities and remote targets fail closed.
+There is no fallback to individual kills. `pane.close` automation must pass
+`close_context: {mode: "automatic", handoff: "<one-use capability>"}` to retain automatic-close protections.
+An uncertain result keeps its original operation evidence. Retry the same target
+to reconcile that operation without sending another kill, or use
+`terminal.close_reconcile {operation_id}` if its original container moved or
+vanished; only an exact audited
+receipt removes the original panes. Natural exits are removed only after a read-only native snapshot and signal-free
+helper audit of their pre-exit binding and actual Exit witness. Unbound natural
+exits remain visible. A native `close_retry_safe` denial certifies
+no signal was sent: the layout stays intact and a later close uses a new operation.
+Timeouts and unknown results require original-operation reconciliation.
+Unverified natural exits and removed core records keep their panes. App quit
+and window close keep sessions; shutdown hooks cannot bypass the batch gate.
 
 The one way to change anything; keys, mods (`run(name, args)`), menus and
 you use the same list. `herdr-app commands` prints every one with its arguments
@@ -534,7 +573,7 @@ The main ones:
   `tab.settle {id?}`, `tab.unsettle {id?}` (index, next and prev
   skip settled tabs).
 - Panes: `pane.split {direction: "right" | "down", pane?, argv? | mod?, props?}` (a new
-  terminal, or a mod pane), `pane.close {pane?}`,
+  terminal, or a mod pane), `pane.close {pane?, close_context?: {mode: "automatic", handoff: string}}`,
   `pane.zoom {pane?}`, `pane.focus {pane | terminal}`, `pane.go {direction}`, `pane.swap {direction}`,
   `pane.move {pane?, to, edge?}` (onto pane or terminal `to` in the same tab: swap, or with
   `edge` "left" | "right" | "up" | "down" beside it, as a drag drops it; the terminal keeps running).
@@ -553,7 +592,8 @@ The main ones:
   starting directory for tabs and right/down splits, with or without `argv`), `terminal.kill {terminal}`,
   `terminal.keep {terminal, place?}`, `terminal.park {terminal}`,
   `terminal.peek {terminal}` (peek over the tab, with keep-as-tab and close),
-  `terminal.show {terminal?, pane?}`, `terminal.copy`, `terminal.paste` (copied
+  `terminal.show {terminal?, pane?}`, `terminal.search` (screen and scrollback;
+  find bar state stays with that terminal), `terminal.copy`, `terminal.paste` (copied
   files, such as Finder's or a clipboard manager's image, as if dropped; an image
   alone as `terminal.paste_image` pastes it), `terminal.paste_image` (Ctrl+V: an
   image, into a terminal on another machine: copied there, its path pasted; on
@@ -563,6 +603,10 @@ The main ones:
   `terminal.right_click {to: "program" | "menu", terminal?}` (where right-clicks go
   when the program takes the mouse; kept as its label `herdr.right-click=program`;
   Shift+right-click is always Herdr's menu),
+  `terminal.scroll {lines | pages | to: "top" | "bottom", terminal?}` (moves Herdr's view of the
+  history, not the program: negative lines or pages go up, toward history; pages may be
+  fractional, one page is the terminal's rows; on the alternate screen, such as vim or less,
+  there is no history, so nothing moves),
   `terminal.pin {terminal, pinned}` (pins an agent to the top of the agent lists;
   kept on the terminal as `herdr.pinned`, so every Herdr client shows it, and
   gone when the terminal ends; read it as `agents()` `pinned`). Copy, paste, paste-image and implicit
@@ -580,6 +624,7 @@ The main ones:
   (personal tree edits; on shipped layouts only click/look fields change),
   `layout.reset {name?}` (reset a shipped layout and its clicks),
   `layout.clone {name, as?}` (duplicate, then switch; default `<name>-copy`).
+- Recovery: `app.close_evidence_reload` (reload a repaired original operation file; never closes a session).
 - App: `mod.clone {name, as?}` (duplicate; default `<name>-copy`), `mod.open {name}` (again: closes it), `overlay.close {id?}`, `app.help` (again: closes it), `app.palette` (again: closes it), `app.settings {section?}`
   (sections: `look`, `machines`, `alerts`, `updates`, `privacy`; Machines lists, updates, renames and removes ssh machines; settings edit the same files you do).
   `app.check_updates` (only a successful check reports Up to date; a failed check clears the checked time and can be retried), `app.update_core` (a newer herdr-core of this generation, terminals kept;
@@ -697,6 +742,10 @@ What's about the user, never a look:
   `p` writes Linux primary selection. `s` is ignored; cut buffers `0`–`7`
   are treated as the system clipboard.
   Clipboard reads (`?`) are never allowed.
+- `pane_scrollbars`: `false` hides the scroll position thumb at a terminal
+  pane's right edge (default `true`). It shows only when the pane has
+  scrollback — never on the alternate screen (editors, pagers) — and
+  drags to move through it.
 - `telemetry`: `false` stops anonymous usage data and deletes what wasn't
   sent (on when absent; Settings → Privacy shows each report word for
   word, and `telemetry()` in mods). Once a day the app sends counts:
@@ -858,11 +907,11 @@ Rules:
   call when its pane, tab, layout-owned slot or overlay goes, and on app quit.
   It is not called for a hidden copy or an inactive tab. Start cleanup inside
   `close()`; don't await work started earlier. Await cleanup directly,
-  for example `async close(cx) { await exec("hc", ["kill", this.browser]); }`.
+  for example `async close(cx) { await exec("my-helper", ["flush"]); }`.
   Closing stays responsive: cleanup has at most 250 ms (shared across copies
-  on quit), then unfinished tasks are cancelled. On quit, use `exec(...)` and
-  `run("terminal.kill", { terminal: address })`: those go out before the event
-  loop stops; other commands may not run. An `exec` already started keeps
+  on quit), then unfinished tasks are cancelled. On quit, `exec(...)` can be
+  issued before the event loop stops; terminal.kill is refused during shutdown
+  because no guarded window close transaction can be retained. An `exec` already started keeps
   running; don't start new long-lived work in `close`. This is best-effort,
   not a guarantee after a crash or forced termination.
 - Use `theme()` colors so the mod follows the user's theme.
@@ -997,3 +1046,20 @@ including a small herdr-core skill you can install with the user's permission.
 - One mod per idea. Don't edit `AGENTS.md` or the `.d.ts` files (the app
   rewrites them). Don't touch other mods unless the request
   needs it.
+
+The local close-guard app requires the matching reviewed core/helper first:
+terminal.kill_batch, terminal.close_reconcile, and terminal.close_snapshot.
+A core version alone does not establish compatibility. Install the app last after
+isolated validation and review. The automatic idle closer leaves each workspace's last
+session for a person to close manually.
+
+If retained close evidence is corrupt, the error names the exact file. Preserve
+it and restore that same operation file from a verified backup. Do not delete it
+or guess identities. Run app.close_evidence_reload after repair; this reload
+never closes a session or releases an uncertain hold by itself.
+
+An exited pane that cannot yet be audited shows a Cleanup pending reason. Its
+read-only automatic checks are bounded (30s, then 120s; three attempts total).
+Close that pane explicitly to retry or join its current audit. Observed cleanup
+does not hold the person's structural-command slot; unknown operation evidence
+is still preserved.
