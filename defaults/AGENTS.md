@@ -246,7 +246,8 @@ Properties any node can have:
   on top-edge hover, regardless of the header's position or presence. A header press
   the mod doesn't stop on mouse down drags once the pointer moves; without moving it
   stays the header's click. Header mods don't need drag handlers; stop the press on
-  controls that shouldn't drag. `panes()` exposes `movable`.
+  controls that shouldn't drag. Like resizing, a drag needs the machine's layout
+  to be saveable, when it starts and at the drop. `panes()` exposes `movable`.
 - `floating`: blocks over this node (below).
 - `window_drag: true`: dragging the node moves the window, a double-click
   maximizes it. A mod's own control inside opts out by stopping the press:

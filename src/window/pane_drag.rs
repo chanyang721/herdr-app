@@ -48,6 +48,12 @@ impl AppWindow {
             .unwrap_or(true)
     }
 
+    /// A move is a layout write: like `pane.move` and resizing, it needs the
+    /// pane's machine document, checked when the drag starts and again at the drop.
+    fn pane_layout_writable(&self, pane: &str) -> bool {
+        self.model.space_of(pane).is_some_and(|s| self.require_document(s.machine.as_deref()).is_ok())
+    }
+
     pub(super) fn pane_grip(&self, pane: &str, header: Option<f32>, cx: &mut Context<Self>) -> Option<AnyElement> {
         let row = header.unwrap_or(STRIP).max(STRIP);
         self.pane_grip_rows.borrow_mut().insert(pane.to_owned(), row);
@@ -91,7 +97,7 @@ impl AppWindow {
 
     pub(super) fn pane_press(&mut self, pane: &str, at: Point<Pixels>, grip: bool, cx: &mut Context<Self>) {
         let Some(tab) = self.model.active_tab().filter(|t| t.root.find(pane).is_some()).map(|t| t.id.clone()) else { return };
-        if self.pane_movable(pane) {
+        if self.pane_movable(pane) && self.pane_layout_writable(pane) {
             self.pane_drag = Some(PaneDrag { pane: pane.to_owned(), tab, down: at, grip, moving: false, target: None });
             cx.notify();
         }
@@ -142,6 +148,7 @@ impl AppWindow {
             return d.grip;
         }
         if self.pane_movable(&d.pane)
+            && self.pane_layout_writable(&d.pane)
             && let Some((target, edge)) = target
             && self.model.move_pane(&d.pane, &target, edge)
         {

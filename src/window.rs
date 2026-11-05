@@ -5362,6 +5362,154 @@ export default class Header extends View {
         assert_eq!(order(cx), ["t3", "t1", "t2"]);
     }
 
+    /// A pane move is a layout write: grip and header drags, like pane.move,
+    /// change nothing while the machine's layout can't be saved (also when it
+    /// goes away mid-drag) or the panes aren't movable, and a header control
+    /// that stops the press keeps it. A move that lands survives a save and load.
+    #[test]
+    fn pane_drags_write_only_a_saveable_layout() {
+        in_own_process("pane_drag_guards");
+    }
+
+    #[gpui::test]
+    fn pane_drag_guards(cx: &mut gpui::TestAppContext) {
+        use crate::{layout::Axis, model::{Model, Tab}};
+        use gpui::{Modifiers, MouseButton, MouseMoveEvent, point, px};
+        use serde_json::json;
+        if !running_alone("pane_drag_guards") {
+            return;
+        }
+        let header = r#"import { View, div } from "gpui-kit";
+import { shared, setShared } from "herdr";
+
+export default class Header extends View {
+  render() {
+    return div().size_full().flex().flex_row().child(
+      div().id("control").w(40).h_full().on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+        .on_click(() => setShared("control.clicks", (shared("control.clicks") ?? 0) + 1))
+    ).child(div().flex_1().h_full());
+  }
+}
+"#;
+        let layout = json!({ "id": "root", "type": "block", "content": { "tab": "active", "pane": {
+            "header": { "content": { "mod": "pane-header" }, "height": 30, "position": "top", "reveal": "always" } } } });
+        let (view, cx) = open_window(cx, "pane-header", header, layout);
+        cx.update(|window, cx| view.update(cx, |this, cx| {
+            this.model.add_space("p1", "s", "/tmp", Tab::new("c1", "1", "x1", "t1"));
+            assert!(this.model.split("x1", Axis::Row, "x2", "t2"));
+            assert!(this.model.split("x2", Axis::Row, "x3", "t3"));
+            this.documents.entry(String::new()).or_default().available = true;
+            this.sync(window, cx);
+        }));
+        let settle = |cx: &mut gpui::VisualTestContext| {
+            for _ in 0..3 {
+                cx.update(|window, _| window.refresh());
+                cx.executor().advance_clock(std::time::Duration::from_millis(500));
+                cx.run_until_parked();
+            }
+        };
+        settle(cx);
+        let order = |cx: &mut gpui::VisualTestContext| view.update(cx, |this, _| {
+            this.model.active_tab().unwrap().root.panes().iter().map(|n| this.model.address_of(&n.id).unwrap()).collect::<Vec<_>>()
+        });
+        let tree = |cx: &mut gpui::VisualTestContext| view.update(cx, |this, _| format!("{:?}", this.model.spaces));
+        // In a pane's header: on the control (left 40px) or past it.
+        let at = |cx: &mut gpui::VisualTestContext, address: &str, spot: &str| view.update(cx, |this, _| {
+            let pane = this.model.pane_of(address).unwrap();
+            let b = *this.bounds.borrow().get(&pane).unwrap();
+            match spot {
+                "control" => point(b.left() + px(12.), b.top() + px(10.)),
+                "header" => point(b.left() + px(80.), b.top() + px(10.)),
+                _ => b.center(),
+            }
+        });
+        let drag_to = |cx: &mut gpui::VisualTestContext, to| {
+            cx.simulate_event(MouseMoveEvent { position: to, pressed_button: Some(MouseButton::Left), modifiers: Modifiers::none() });
+            cx.run_until_parked();
+        };
+        let available = |cx: &mut gpui::VisualTestContext, yes: bool| view.update(cx, |this, _| {
+            this.documents.get_mut("").unwrap().available = yes;
+        });
+        let dragging = |cx: &mut gpui::VisualTestContext| view.update(cx, |this, _| this.pane_drag.is_some());
+        let pane_move = |cx: &mut gpui::VisualTestContext, args: serde_json::Value| {
+            cx.update(|window, cx| view.update(cx, |this, cx| this.run_as("pane.move", args, false, window, cx)))
+        };
+        // grip: the grip's own press (pane_grip), else a header press.
+        let gesture = |cx: &mut gpui::VisualTestContext, grip: bool, drop_unavailable: bool| {
+            let (from, to) = (at(cx, "t3", "header"), at(cx, "t1", "center"));
+            if grip {
+                cx.update(|_, cx| view.update(cx, |this, cx| this.pane_press("x3", from, true, cx)));
+            } else {
+                cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::none());
+            }
+            drag_to(cx, to);
+            if drop_unavailable {
+                available(cx, false);
+            }
+            cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
+            settle(cx);
+        };
+        let before = tree(cx);
+
+        // No saveable layout: the command and both gestures leave the tree alone.
+        available(cx, false);
+        assert!(pane_move(cx, json!({ "pane": "x3", "to": "x1" }))["error"].is_string());
+        assert_eq!(tree(cx), before);
+        for grip in [false, true] {
+            gesture(cx, grip, false);
+            assert!(!dragging(cx), "grip {grip}");
+            assert_eq!(tree(cx), before, "grip {grip}");
+        }
+        available(cx, true);
+
+        // The layout goes away during the drag: the drop changes nothing.
+        for grip in [false, true] {
+            gesture(cx, grip, true);
+            assert!(!dragging(cx), "grip {grip}");
+            assert_eq!(tree(cx), before, "grip {grip}");
+            available(cx, true);
+        }
+
+        // Panes the layout pins don't move by gesture or command.
+        view.update(cx, |this, _| this.model.tab_mut("c1").unwrap().root.movable = Some(false));
+        for grip in [false, true] {
+            gesture(cx, grip, false);
+            assert_eq!(order(cx), ["t1", "t2", "t3"], "grip {grip}");
+        }
+        assert!(pane_move(cx, json!({ "pane": "x3", "to": "x1" }))["error"].is_string());
+        view.update(cx, |this, _| this.model.tab_mut("c1").unwrap().root.movable = None);
+        let before = tree(cx);
+
+        // A header control that stops the press keeps it: no drag starts.
+        let (from, to) = (at(cx, "t3", "control"), at(cx, "t1", "center"));
+        cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::none());
+        drag_to(cx, to);
+        assert!(!dragging(cx));
+        cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
+        settle(cx);
+        assert_eq!(tree(cx), before);
+        cx.simulate_click(from, Modifiers::none());
+        settle(cx);
+        assert_eq!(crate::mods::shared("control.clicks").and_then(|v| v.as_u64()), Some(1));
+
+        // A move that lands is what the machine's document saves and loads back.
+        gesture(cx, false, false);
+        assert_eq!(order(cx), ["t3", "t2", "t1"]);
+        let (saved, panes) = view.update(cx, |this, _| {
+            let doc = crate::mirror::Document::capture(&this.model, None);
+            let panes: Vec<(String, String)> = this.model.active_tab().unwrap().root.panes().iter()
+                .map(|n| (n.id.clone(), this.model.address_of(&n.id).unwrap())).collect();
+            (serde_json::to_value(&doc).unwrap(), panes)
+        });
+        let loaded: crate::mirror::Document = serde_json::from_value(saved).unwrap();
+        let mut fresh = Model::default();
+        loaded.replace(&mut fresh, None);
+        let reloaded: Vec<(String, String)> = fresh.tabs().next().unwrap().root.panes().iter()
+            .map(|n| (n.id.clone(), fresh.address_of(&n.id).unwrap())).collect();
+        assert_eq!(reloaded, panes);
+        assert_eq!(panes, [("x3".to_owned(), "t3".to_owned()), ("x2".into(), "t2".into()), ("x1".into(), "t1".into())]);
+    }
+
     /// Mods see window().active follow the focus, losing it too: a probe mod
     /// notes every value it renders with while the window is focused and
     /// blurred, and the poll that checks the focus runs in between.
