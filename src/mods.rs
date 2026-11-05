@@ -401,8 +401,8 @@ thread_local! {
     static FINAL_KILLS: RefCell<Option<(std::sync::Arc<crate::hc::Core>, std::time::Instant)>> = const { RefCell::new(None) };
 }
 
-/// The event loop stops before queued commands run at quit. Send final terminal
-/// kills to the core now, bounded by the same deadline as the mod's cleanup.
+/// Mark the bounded shutdown scope. A terminal close needs a retained window
+/// transaction, so it must not take a direct-kill shortcut while this scope runs.
 pub fn final_cleanup(core: std::sync::Arc<crate::hc::Core>, deadline: std::time::Instant, body: impl FnOnce()) {
     struct Reset;
     impl Drop for Reset {
@@ -880,11 +880,6 @@ pub fn run_here(command: &str, args: &[String]) -> Option<String> {
     run_blocking(command, args, None).ok().map(|(_, out, _)| out)
 }
 
-/// A program's output on another machine, if it ran.
-pub fn run_on(machine: &str, command: &str, args: &[String]) -> Option<String> {
-    run_remote(machine, command, args, None).ok().map(|(_, out, _)| String::from_utf8_lossy(&out).into_owned())
-}
-
 /// The agents a machine can start (`knownAgents()`), asked at most once a minute.
 fn known_agents(on: Option<String>, list: Vec<Value>) -> Value {
     type InstalledCache = std::collections::HashMap<Option<String>, (std::time::Instant, Vec<String>, Vec<String>)>;
@@ -1064,10 +1059,10 @@ fn module(inst: Instance, copy: u64) -> HostModule {
                 crate::commands::validate_args(command, &args).map_err(HostError::new)?;
             }
             let final_kill = (name == "terminal.kill").then(|| FINAL_KILLS.with_borrow(Clone::clone)).flatten();
-            if let Some((core, deadline)) = final_kill {
-                if let Err(error) = core.call_timeout(&name, args, deadline.saturating_duration_since(std::time::Instant::now())) {
-                    tracing::warn!("final terminal.kill: {error:#}");
-                }
+            if final_kill.is_some() {
+                // Shutdown has no live window transaction to retain the close plan.
+                // Refuse instead of bypassing the guarded batch through a direct kill.
+                return Err(HostError::new("terminal.kill is unavailable during shutdown; use a guarded close before quitting"));
             } else {
                 request(Request::Run { name, args });
             }

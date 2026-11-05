@@ -40,13 +40,14 @@ pub const COMMANDS: &[Command] = &[
     cmd("tab.rename", &[opt("id"), opt("name")], "Rename a tab (asks the person when no name; an empty name: called by its number again)."),
     cmd("tab.move", &[req("id"), req("index")], "Move a tab to a position in its space (1 = first)."),
     cmd("pane.split", &[req("direction"), opt("pane"), opt("argv"), opt("mod"), opt("props")], "Split a pane (default: the focused one) \"right\" or \"down\" with a new terminal, or with a mod (`mod`, its `props`) beside it."),
-    cmd("pane.close", &[opt("pane")], "Close a pane and end its terminal."),
+    cmd("pane.close", &[opt("pane"), opt("close_context")], "Close a pane and end its terminal."),
     cmd("terminal.open", &[opt("argv"), opt("folder"), opt("place"), opt("name")], "Start a terminal: as a new tab (place \"tab\", default), or \"right\"/\"down\" of the focused pane."),
     cmd("terminal.keep", &[req("terminal"), opt("place")], "Give a running terminal without a pane (a sub-agent) a pane: a new tab, or \"right\"/\"down\"."),
     cmd("terminal.park", &[req("terminal")], "Take a terminal's pane away and disable core keep; it keeps running (a sub-agent shows under its parent again)."),
     cmd("terminal.right_click", &[req("to"), opt("terminal")], "Where right-clicks in a terminal (default: the focused one) go when its program takes the mouse: \"program\" or \"menu\" (Herdr's, the default). Shift+right-click is always the menu."),
     cmd("terminal.pin", &[req("terminal"), req("pinned")], "Pin an agent to the top of the agent lists (pinned true) or unpin it (false). Pins are kept with the terminal, so every Herdr client shows them, and end with it."),
     cmd("terminal.kill", &[req("terminal")], "End a terminal and its sub-agents."),
+    cmd("terminal.close_reconcile", &[req("operation_id")], "Reconcile a retained close operation without sending another kill."),
     // What you see.
     cmd("space.select", &[opt("index"), opt("id")], "Show a space (by position or id)."),
     cmd("space.next", &[], "Show the next space."),
@@ -63,8 +64,10 @@ pub const COMMANDS: &[Command] = &[
     cmd("terminal.peek", &[req("terminal")], "Peek at a running terminal over the tab, with keep-as-tab and close controls."),
     cmd("terminal.show", &[opt("terminal"), opt("pane")], "Show a terminal in a pane for now, in place of its own (no terminal: back)."),
     cmd("terminal.copy", &[], "Copy the focused terminal's selection. With nothing selected, that key goes to the program."),
+    cmd("terminal.scroll", &[opt("lines"), opt("pages"), opt("to"), opt("terminal")], "Scroll a terminal's view of its history (default: the focused one). Give exactly one of: lines (a whole number; negative goes up, toward history), pages (a number, fractions allowed; one page is the terminal's rows), to: \"top\" (oldest history) or \"bottom\" (the live screen). This scrolls Herdr's view, not the program."),
     cmd("terminal.paste", &[], "Paste into the focused terminal (copied files as if dropped; an image alone as terminal.paste_image pastes it)."),
     cmd("terminal.paste_image", &[], "Ctrl+V: the clipboard's image as a file on the focused terminal's machine, when that's another one; on Windows, paste clipboard text; otherwise Ctrl+V goes to the terminal."),
+    cmd("terminal.search", &[], "Search the focused terminal's screen and scrollback; the find bar and query stay with that terminal."),
     cmd("agent.focus", &[req("terminal")], "Show an agent (sub-agents too)."),
     cmd("agent.next", &[], "Show the next agent, in the order the agents list shows them."),
     cmd("agent.prev", &[], "Show the previous agent."),
@@ -81,6 +84,7 @@ pub const COMMANDS: &[Command] = &[
     cmd("mod.open", &[req("name")], "Toggle a mod as the overlay its mod.json describes; calling again closes it."),
     cmd("overlay.close", &[opt("id")], "Close an overlay (default: the top dialog or popup)."),
     // The app.
+    cmd("app.close_evidence_reload", &[], "Reload repaired close evidence without closing a session."),
     cmd("app.help", &[], "Toggle the keys dialog."),
     cmd("app.welcome", &[], "Show the welcome again."),
     cmd("app.whats_new", &[], "Show what this release brought (it opens once by itself after an update)."),
@@ -121,6 +125,15 @@ pub fn shorthand(c: &Command, value: &str) -> Value {
 
 /// Reject misspelled arguments before a command can use its current-target default.
 /// Null is the argument-free form used by keys and mods.
+/// The capability is opaque to the app and is passed unchanged to the helper.
+pub(crate) fn validate_close_context(context: &Value) -> Result<(), String> {
+    if context.is_null() { return Ok(()); }
+    if context.as_object().is_some_and(|v| v.len() == 2
+        && v.get("mode").and_then(Value::as_str) == Some("automatic")
+        && v.get("handoff").and_then(Value::as_str).is_some_and(|s| !s.is_empty() && s.len() <= 4096)) { return Ok(()); }
+    Err("close_context must contain automatic mode and an opaque handoff, or be omitted".into())
+}
+
 pub fn validate_args(c: &Command, args: &Value) -> Result<(), String> {
     let valid = if c.args.is_empty() { "none".into() } else { c.args.iter().map(|a| a.name).collect::<Vec<_>>().join(", ") };
     match args {
@@ -131,6 +144,7 @@ pub fn validate_args(c: &Command, args: &Value) -> Result<(), String> {
                 return Err(format!("{}: unknown argument(s): {}; valid arguments: {valid}", c.name, unknown.join(", ")));
             }
             for (key, value) in args {
+                if key == "close_context" { validate_close_context(value)?; }
                 if matches!(key.as_str(), "id" | "pane" | "space" | "terminal") && !value.is_string() && !value.is_null() {
                     return Err(format!("{}: argument {key} must be a string (or null to omit it)", c.name));
                 }
@@ -185,7 +199,7 @@ mod tests {
             assert!(validate_args(c, &Value::Null).is_ok());
             assert!(validate_args(c, &json!({})).is_ok());
             assert!(validate_args(c, &json!(["target"])).is_err());
-            let args: serde_json::Map<String, Value> = c.args.iter().map(|a| (a.name.into(), json!("target"))).collect();
+            let args: serde_json::Map<String, Value> = c.args.iter().map(|a| (a.name.into(), if a.name == "close_context" {json!({"mode":"automatic","handoff":"one-use-test-capability"})} else {json!("target")})).collect();
             assert!(validate_args(c, &Value::Object(args)).is_ok());
         }
         let close = find("space.close").unwrap();
@@ -222,5 +236,14 @@ mod tests {
         assert_eq!(missing(move_, &json!({ "id": "sp1", "index": 1 })), None);
         // Names are optional: none is Herdr's automatic one.
         assert_eq!(missing(find("space.new").unwrap(), &json!({})), None);
+    }
+
+    #[test]
+    fn automatic_close_context_is_explicit_and_cannot_be_malformed() {
+        let c = find("pane.close").unwrap();
+        assert!(validate_args(c, &json!({"pane":"p", "close_context":{"mode":"automatic","handoff":"one-use-test-capability"}})).is_ok());
+        for value in [json!({"mode":"automatic"}),json!({"mode":"automatic","handoff":""}),json!({"mode":"automatic","handoff":5}),json!({"mode":"automatic","handoff":"x","force":true}),json!(true),json!("automatic"),json!({}),json!({"mode":"manual"}),json!({"mode":"automatic","force":true})] {
+            assert!(validate_args(c,&json!({"pane":"p","close_context":value})).is_err());
+        }
     }
 }

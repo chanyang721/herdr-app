@@ -36,6 +36,7 @@ fn inherited_movable(root: &Node, id: &str) -> Option<bool> {
 
 impl AppWindow {
     pub(super) fn pane_movable(&self, pane: &str) -> bool {
+        if self.pending_close.is_some() { return false; }
         let Some(tab) = self.model.active_tab() else { return false };
         if tab.zoomed.is_some() || tab.root.panes().len() < 2 || !tab.root.find(pane).is_some_and(Node::is_pane) {
             return false;
