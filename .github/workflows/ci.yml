@@ -9,6 +9,7 @@ on:
     branches: [master]
   # No paths-ignore here: CI is required to merge, so every PR needs it.
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -35,11 +36,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # Match release's glibc floor and native platform runners.
-          - { platform: linux-x86_64, runner: ubuntu-22.04 }
-          - { platform: macos-aarch64, runner: macos-15 }
-          - { platform: windows-x86_64, runner: windows-2022 }
+        # Match release's glibc floor and native platform runners.
+        # Forks: macOS only when run by hand. Hosted macOS runners there often
+        # go unassigned, and an unassigned job fails the whole run.
+        include: ${{ fromJSON(github.repository_owner != 'herdrdev' && github.event_name != 'workflow_dispatch'
+          && '[{"platform":"linux-x86_64","runner":"ubuntu-22.04"},{"platform":"windows-x86_64","runner":"windows-2022"}]'
+          || '[{"platform":"linux-x86_64","runner":"ubuntu-22.04"},{"platform":"macos-aarch64","runner":"macos-15"},{"platform":"windows-x86_64","runner":"windows-2022"}]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     defaults:
@@ -137,7 +139,8 @@ jobs:
   # Keep the required check name stable while requiring every platform.
   test:
     needs: platform-tests
-    if: always()
+    # Forks: a run cancelled by a newer push is not a failure.
+    if: ${{ github.repository_owner == 'herdrdev' && always() || !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
