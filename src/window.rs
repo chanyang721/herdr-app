@@ -2725,7 +2725,7 @@ impl AppWindow {
             if !args.is_object() { args = json!({}); }
             args["machine"] = json!(machine);
         }
-        if matches!(name, "space.new" | "space.close" | "space.rename" | "space.move" | "tab.new" | "tab.close" | "tab.rename" | "tab.move" | "pane.split" | "pane.close" | "pane.swap" | "terminal.keep" | "terminal.park") {
+        if matches!(name, "space.new" | "space.close" | "space.rename" | "space.move" | "tab.new" | "tab.close" | "tab.rename" | "tab.move" | "pane.split" | "pane.close" | "pane.swap" | "pane.move" | "terminal.keep" | "terminal.park") {
             let node = ["id", "space", "pane"].into_iter().find_map(|k| Self::arg(&args, k));
             let target = node.and_then(|id| self.model.space(id).or_else(|| self.model.space_of(id))).or_else(|| self.model.active_space());
             let machine = if name == "space.new" { Self::arg(&args, "machine") }
@@ -2947,6 +2947,29 @@ impl AppWindow {
                 self.focused_pane = None;
                 self.agent = self.model.address_of(&p);
                 self.swapped.remove(&p);
+            }
+            "pane.move" => {
+                let Some(source) = Self::owned(a, "pane").or_else(|| self.model.focused_pane()) else { return self.fail("no pane to move") };
+                let Some(to) = Self::arg(a, "to") else { return self.fail("pane.move needs to") };
+                let edge = match Self::arg(a, "edge") {
+                    None => None,
+                    Some("left") => Some(crate::layout::Edge::Left),
+                    Some("right") => Some(crate::layout::Edge::Right),
+                    Some("up") => Some(crate::layout::Edge::Top),
+                    Some("down") => Some(crate::layout::Edge::Bottom),
+                    Some(other) => return self.fail(format!("pane.move edge is left, right, up or down, not {other:?}")),
+                };
+                let target = if self.model.tab_of(to).is_some() { Some(to.to_owned()) } else { self.model.pane_of(to) };
+                let Some(target) = target else { return self.fail(format!("no pane or terminal {to:?}")) };
+                let same_tab = self.model.tab_of(&source).zip(self.model.tab_of(&target)).is_some_and(|(s, t)| s.id == t.id && t.zoomed.is_none());
+                if source == target || !same_tab || !self.pane_movable(&source) {
+                    return self.fail("pane.move moves a movable pane onto another pane of the same unzoomed tab");
+                }
+                if !self.model.move_pane(&source, &target, edge) {
+                    return self.fail("the pane could not be moved there");
+                }
+                self.cancel_pane_drag(cx);
+                self.sync(window, cx);
             }
             "pane.go" | "pane.swap" => {
                 let dir = Self::arg(a, "direction").unwrap_or_default();
@@ -3887,7 +3910,10 @@ impl AppWindow {
         el = shadow(el, f.shadow.as_deref());
         let body = div().flex_1().min_h_0().flex().child(inner);
         let Some(h) = &f.header else { return el.child(body).into_any_element() };
+        let pane = n.id.clone();
+        // Pressing the header and moving drags the pane, as the grip does (pane_drag.rs).
         let head = div().flex_none().h(settings::z(pane_size::header_height(h))).w_full().flex()
+            .on_mouse_down(MouseButton::Left, cx.listener(move |this, ev: &MouseDownEvent, _, cx| this.pane_header_press(&pane, ev.position, cx)))
             .child(self.render_slot(&format!("{}#frame", n.id), cx));
         if h.hover() {
             let head = head.absolute().left_0().right_0().opacity(0.).group_hover(group, |s| s.opacity(1.));
@@ -4510,6 +4536,7 @@ fn needs_model_pane(name: &str, args: &Value) -> bool {
     match name {
         "pane.split" | "pane.close" | "pane.zoom" | "terminal.show" => AppWindow::arg(args, "pane").is_none(),
         "pane.go" | "pane.swap" => true,
+        "pane.move" => AppWindow::arg(args, "pane").is_none(),
         "terminal.open" | "terminal.keep" => matches!(AppWindow::arg(args, "place"), Some("right" | "down")),
         _ => false,
     }
@@ -5195,6 +5222,144 @@ mod tests {
         cx.update(|window, cx| view.update(cx, |this, _| {
             assert!(this.focused_path(window).contains("pane"));
         }));
+    }
+
+    /// A pane moves by pressing its header and dragging it onto another
+    /// pane: a plain click still reaches the header mod, Escape or a release
+    /// off every pane changes nothing, and terminals stay with their panes.
+    #[test]
+    fn pane_headers_drag_panes_without_taking_their_clicks() {
+        in_own_process("pane_header_drag");
+    }
+
+    #[gpui::test]
+    fn pane_header_drag(cx: &mut gpui::TestAppContext) {
+        use crate::{layout::Axis, model::Tab};
+        use gpui::{Modifiers, MouseButton, MouseMoveEvent, point, px};
+        use serde_json::json;
+        if !running_alone("pane_header_drag") {
+            return;
+        }
+        let header = r#"import { View, div } from "gpui-kit";
+import { shared, setShared } from "herdr";
+
+export default class Header extends View {
+  render() {
+    return div().id("header").size_full().on_click(() => setShared("header.clicks", (shared("header.clicks") ?? 0) + 1));
+  }
+}
+"#;
+        let layout = json!({ "id": "root", "type": "block", "content": { "tab": "active", "pane": {
+            "header": { "content": { "mod": "pane-header" }, "height": 30, "position": "top", "reveal": "always" } } } });
+        let (view, cx) = open_window(cx, "pane-header", header, layout);
+        cx.update(|window, cx| view.update(cx, |this, cx| {
+            this.model.add_space("p1", "s", "/tmp", Tab::new("c1", "1", "x1", "t1"));
+            assert!(this.model.split("x1", Axis::Row, "x2", "t2"));
+            assert!(this.model.split("x2", Axis::Row, "x3", "t3"));
+            this.documents.entry(String::new()).or_default().available = true;
+            this.sync(window, cx);
+        }));
+        // Mods draw and answer on their own turn.
+        let settle = |cx: &mut gpui::VisualTestContext| {
+            for _ in 0..3 {
+                cx.update(|window, _| window.refresh());
+                cx.executor().advance_clock(std::time::Duration::from_millis(500));
+                cx.run_until_parked();
+            }
+        };
+        settle(cx);
+        let order = |cx: &mut gpui::VisualTestContext| view.update(cx, |this, _| {
+            this.model.active_tab().unwrap().root.panes().iter().map(|n| this.model.address_of(&n.id).unwrap()).collect::<Vec<_>>()
+        });
+        let at = |cx: &mut gpui::VisualTestContext, address: &str, header: bool| view.update(cx, |this, _| {
+            let pane = this.model.pane_of(address).unwrap();
+            let b = *this.bounds.borrow().get(&pane).unwrap();
+            if header { point(b.left() + px(12.), b.top() + px(10.)) } else { b.center() }
+        });
+        let drag_to = |cx: &mut gpui::VisualTestContext, to| {
+            cx.simulate_event(MouseMoveEvent { position: to, pressed_button: Some(MouseButton::Left), modifiers: Modifiers::none() });
+            cx.run_until_parked();
+        };
+        let clicks = || crate::mods::shared("header.clicks").and_then(|v| v.as_u64()).unwrap_or(0);
+        let dragging = |cx: &mut gpui::VisualTestContext| view.update(cx, |this, _| this.pane_drag.is_some());
+        assert_eq!(order(cx), ["t1", "t2", "t3"]);
+
+        // A click on the header is the header's: no drag, nothing moves.
+        let h = at(cx, "t3", true);
+        cx.simulate_click(h, Modifiers::none());
+        settle(cx);
+        assert_eq!(clicks(), 1);
+        assert!(!dragging(cx));
+        assert_eq!(order(cx), ["t1", "t2", "t3"]);
+
+        // A small wobble is still a click.
+        let h = at(cx, "t3", true);
+        cx.simulate_mouse_down(h, MouseButton::Left, Modifiers::none());
+        drag_to(cx, point(h.x + px(2.), h.y + px(1.)));
+        cx.simulate_mouse_up(point(h.x + px(2.), h.y + px(1.)), MouseButton::Left, Modifiers::none());
+        settle(cx);
+        assert_eq!(clicks(), 2);
+        assert_eq!(order(cx), ["t1", "t2", "t3"]);
+
+        // Escape cancels a drag in flight.
+        let (h, target) = (at(cx, "t3", true), at(cx, "t1", false));
+        cx.simulate_mouse_down(h, MouseButton::Left, Modifiers::none());
+        drag_to(cx, target);
+        assert!(dragging(cx));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(!dragging(cx));
+        cx.simulate_mouse_up(target, MouseButton::Left, Modifiers::none());
+        settle(cx);
+        assert_eq!(order(cx), ["t1", "t2", "t3"]);
+
+        // A release off every pane changes nothing.
+        let h = at(cx, "t3", true);
+        cx.simulate_mouse_down(h, MouseButton::Left, Modifiers::none());
+        let over = at(cx, "t1", false);
+        drag_to(cx, over);
+        drag_to(cx, point(px(-40.), px(-40.)));
+        cx.simulate_mouse_up(point(px(-40.), px(-40.)), MouseButton::Left, Modifiers::none());
+        settle(cx);
+        assert!(!dragging(cx));
+        assert_eq!(order(cx), ["t1", "t2", "t3"]);
+        assert_eq!(clicks(), 2);
+
+        // Dropped in the middle of another pane, the two swap; the click is not the header's.
+        let (h, target) = (at(cx, "t3", true), at(cx, "t1", false));
+        cx.simulate_mouse_down(h, MouseButton::Left, Modifiers::none());
+        drag_to(cx, target);
+        cx.simulate_mouse_up(target, MouseButton::Left, Modifiers::none());
+        settle(cx);
+        assert_eq!(order(cx), ["t3", "t2", "t1"]);
+        assert_eq!(clicks(), 2);
+        view.update(cx, |this, _| {
+            assert!(this.pane_drag.is_none());
+            assert_eq!(this.model.focused_pane().as_deref(), Some("x3"));
+            for (pane, address) in [("x1", "t1"), ("x2", "t2"), ("x3", "t3")] {
+                assert_eq!(this.model.address_of(pane).as_deref(), Some(address));
+            }
+        });
+
+        // pane.move does the same without a pointer, and refuses what it can't do.
+        let run = |cx: &mut gpui::VisualTestContext, args: serde_json::Value| {
+            cx.update(|window, cx| view.update(cx, |this, cx| this.run_as("pane.move", args, false, window, cx)))
+        };
+        let reply = run(cx, json!({ "pane": "x3", "to": "t1" }));
+        assert!(reply.get("error").is_none(), "{reply}");
+        assert_eq!(order(cx), ["t1", "t2", "t3"]);
+        let reply = run(cx, json!({ "pane": "x3", "to": "x1", "edge": "left" }));
+        assert!(reply.get("error").is_none(), "{reply}");
+        assert_eq!(order(cx), ["t3", "t1", "t2"]);
+        for args in [json!({ "pane": "x3", "to": "x3" }), json!({ "pane": "x3", "to": "t9" }),
+            json!({ "pane": "x3", "to": "x1", "edge": "middle" }), json!({ "pane": "x9", "to": "x1" })] {
+            let reply = run(cx, args.clone());
+            assert!(reply["error"].is_string(), "{args} {reply}");
+            assert_eq!(order(cx), ["t3", "t1", "t2"], "{args}");
+        }
+        view.update(cx, |this, _| this.model.tab_mut("c1").unwrap().zoomed = Some("x1".into()));
+        assert!(run(cx, json!({ "pane": "x3", "to": "x1" }))["error"].is_string());
+        assert_eq!(order(cx), ["t3", "t1", "t2"]);
     }
 
     /// Mods see window().active follow the focus, losing it too: a probe mod
