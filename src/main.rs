@@ -20,6 +20,7 @@ mod persist;
 mod macos;
 mod mods;
 mod mod_files;
+mod json_files;
 mod process_cwd;
 mod programs;
 mod remote_shell;

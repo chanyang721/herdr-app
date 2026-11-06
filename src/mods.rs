@@ -567,7 +567,7 @@ pub struct Snapshot {
     pub focused: Value,
     /// Floating blocks by id: { edge, align, vertical }.
     pub floats: Value,
-    /// { platform, titlebar, buttons, maximized, fullscreen, active }.
+    /// { platform, titlebar, buttons, maximized, fullscreen, active, visible }.
     pub window: Value,
 }
 
@@ -693,6 +693,18 @@ pub fn send_command_to(copy: u64, command: &str) -> bool {
     })
 }
 
+/// A window state event is not a keyboard command: retained copies need it
+/// while hidden too, so their own tasks can stop motion without another frame.
+pub fn notify_window_visibility(copies: impl IntoIterator<Item = u64>) {
+    let copies: std::collections::HashSet<u64> = copies.into_iter().collect();
+    COMMANDS.with_borrow_mut(|commands| {
+        commands.retain(|(_, _, tx)| !tx.is_closed());
+        for (_, _, tx) in commands.iter().filter(|(id, _, _)| copies.contains(id)) {
+            let _ = tx.try_send("window.visibility".to_owned());
+        }
+    });
+}
+
 /// The copies on screen now (`prepare_load` numbers them).
 pub fn set_shown_copies(copies: std::collections::HashSet<u64>) {
     SHOWN_COPIES.with(|s| *s.borrow_mut() = copies);
@@ -749,6 +761,23 @@ fn strings(v: Option<&HostValue>) -> Vec<String> {
 
 fn opt_str(v: Option<&HostValue>, key: &str) -> Option<String> {
     v.and_then(|o| o.get(key)).and_then(HostValue::as_str).map(str::to_owned)
+}
+
+fn json_read_options(options: Option<&HostValue>) -> Result<(Option<String>, u64), HostError> {
+    if options.is_some_and(|o| !o.is_null() && o.as_object().is_none()) {
+        return Err(HostError::new("readJsonFile options must be an object"));
+    }
+    let hash = match options.and_then(|o| o.get("hash")) {
+        None | Some(HostValue::Null) => None,
+        Some(HostValue::Str(s)) => Some(s.clone()),
+        _ => return Err(HostError::new("hash must be a string")),
+    };
+    let max = match options.and_then(|o| o.get("maxBytes")) {
+        None | Some(HostValue::Null) => crate::json_files::DEFAULT_MAX_BYTES,
+        Some(HostValue::Number(n)) if n.is_finite() && n.fract() == 0.0 && *n >= 1.0 && *n <= crate::json_files::MAX_BYTES as f64 => *n as u64,
+        _ => return Err(HostError::new(format!("maxBytes must be an integer in 1..={}", crate::json_files::MAX_BYTES))),
+    };
+    Ok((hash, max))
 }
 
 const EXEC_LIMIT: Duration = Duration::from_secs(30);
@@ -914,6 +943,10 @@ fn module(inst: Instance, copy: u64) -> HostModule {
                 Some(m) => read_remote(&m, &path),
                 None => crate::mod_files::read(Path::new(&path)),
             }))
+        })
+        .async_function("readJsonFile", |a| {
+            let (hash, max_bytes) = json_read_options(a.get(1))?;
+            Ok(crate::json_files::read_json(a.string(0)?.to_owned(), hash, max_bytes))
         })
         .async_function("writeTextFile", |a| {
             let expected = a.get(2).and_then(|v| match v { HostValue::Str(s) => Some(s.clone()), _ => None });
@@ -1193,6 +1226,35 @@ pub fn prepare_load(inst: &Instance) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_options_validate_types_and_enforce_the_hard_cap() {
+        assert_eq!(json_read_options(None).unwrap(), (None, crate::json_files::DEFAULT_MAX_BYTES));
+        let options = |n| HostObject::new().field("maxBytes", n).into();
+        for n in [0.0, -1.0, 0.5, f64::NAN, f64::INFINITY, crate::json_files::MAX_BYTES as f64 + 1.0] {
+            assert!(json_read_options(Some(&options(n))).is_err());
+        }
+        assert_eq!(json_read_options(Some(&options(1024.0))).unwrap().1, 1024);
+        assert!(json_read_options(Some(&HostValue::Str("options".into()))).is_err());
+        assert!(json_read_options(Some(&HostObject::new().field("hash", false).into())).is_err());
+        assert_eq!(json_read_options(Some(&HostObject::new().field("hash", "abc").into())).unwrap().0.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn visibility_notifications_reach_only_the_owning_loaded_copies_even_when_not_shown() {
+        let (a, a_rx) = async_channel::unbounded();
+        let (b, b_rx) = async_channel::unbounded();
+        let ids = [u64::MAX - 1, u64::MAX - 2];
+        COMMANDS.with_borrow_mut(|commands| {
+            commands.push((ids[0], "visibility-a".into(), a));
+            commands.push((ids[1], "visibility-b".into(), b));
+        });
+        assert!(!send_command_to(ids[0], "focus"), "keyboard delivery still excludes hidden copies");
+        notify_window_visibility([ids[0]]);
+        assert_eq!(a_rx.try_recv().unwrap(), "window.visibility");
+        assert!(b_rx.try_recv().is_err(), "a different window's copy is not notified");
+        COMMANDS.with_borrow_mut(|commands| commands.retain(|(id, _, _)| !ids.contains(id)));
+    }
 
     #[test]
     fn exec_timeout_defaults_caps_and_rejects_invalid_values() {

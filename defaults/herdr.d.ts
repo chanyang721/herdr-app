@@ -24,6 +24,21 @@ export function appHome(): string;
 /** Reads UTF-8 text (up to 1 MiB), or null if absent. Runs off the UI thread.
  *  `on`: from that machine (a space's `machine`). */
 export function readTextFile(path: string, options?: { on?: string | null }): Promise<string | null>;
+/** Reads and parses local JSON on a shared native worker. Metadata cache hits do not
+ * reread/hash/parse. Passing the returned hash suppresses an unchanged value.
+ * maxBytes defaults to 8 MiB, is limited to 64 MiB, and applies on cache hits too.
+ * File errors resolve with a distinct status, null hash/value and changed:false.
+ * read_error adds errorKind:not_found (missing optional input) or io (other failure).
+ * No raw OS error string or path is returned.
+ * Invalid options throw at the call site. Paths are used as supplied (no ~ expansion).
+ */
+export function readJsonFile(path: string, options?: { hash?: string | null; maxBytes?: number }): Promise<{
+  status: "ok" | "too_large" | "parse_error" | "read_error";
+  hash: string | null;
+  changed: boolean;
+  value: unknown | null;
+  errorKind?: "not_found" | "io";
+}>;
 /** Writes UTF-8 text only if it still matches expected (null creates a new file).
  * Rejects on a stale snapshot; existing files are replaced atomically. */
 export function writeTextFile(path: string, text: string, expected: string | null): Promise<null>;
@@ -254,6 +269,14 @@ export function window(): {
   maximized: boolean;
   fullscreen: boolean;
   active: boolean;
+  /** Whether the OS reports this window as presenting. Independent of focus.
+   * Live: reading window() in render subscribes to native visibility changes.
+   * nextCommand() also receives "window.visibility" for loaded copies even when
+   * hidden; read window().visible there to suspend motion without another frame.
+   * Minimized/hidden windows are false. Full occlusion is platform-dependent:
+   * macOS supports it; Windows does not; Linux depends on the window manager.
+   * This does not automatically stop a mod's timers: gate motion explicitly. */
+  visible: boolean;
 };
 
 /** For a floating mod: where it sits now. `vertical` on the left/right edges, horizontal on
@@ -402,6 +425,9 @@ export function setShared(key: string, value: unknown): null;
  * With "focusable": true in mod.json, pane.go can move onto this copy and send "focus".
  * Focus your own handle then (this.handle.focus()) and handle keys with on_key_down.
  * The copy gets "focus" again when a popup over it closes. Leave with pane.go.
+ * Native window visibility changes send "window.visibility" even to retained
+ * hidden copies; reread window().visible to suspend motion without a frame.
+ * Use one receiver per copy so competing loops don't split these events.
  *   cx.spawn(async (cx) => { for (;;) { const c = await nextCommand(); ...; cx.notify(); } });
  */
 export function nextCommand(): Promise<string>;

@@ -456,6 +456,8 @@ pub struct AppWindow {
     _focus_lost: Option<Subscription>,
     /// Remembers where the window is (`place.rs`); the write waiting to settle.
     _place: Option<Subscription>,
+    /// Publishes native visibility transitions even while no frame is drawn.
+    _visibility: Option<Subscription>,
     place_write: Option<Task<()>>,
 }
 
@@ -541,12 +543,19 @@ impl AppWindow {
             _tasks: Vec::new(),
             _focus_lost: None,
             _place: None,
+            _visibility: None,
             place_write: None,
         };
         w._focus_lost = Some(cx.on_focus_lost(window, |this, window, cx| this.restore_focus(window, cx)));
         w._place = Some(cx.observe_window_bounds(window, |this, window, cx| {
             if let Some(t) = crate::place::changed(window, cx) {
                 this.place_write = Some(t);
+            }
+        }));
+        w._visibility = Some(cx.observe_window_visibility(window, |this, _, window, cx| {
+            if mods::publish_window(this.window_json(window)) {
+                mods::notify_window_visibility(this.copies.values().map(|copy| copy.id));
+                this.refresh_snapshot_mods(cx);
             }
         }));
         let closing = cx.weak_entity();
@@ -566,6 +575,8 @@ impl AppWindow {
         });
         settings::install_themes();
         crate::programs::install_icons();
+        // View.init may read window() before the first native frame.
+        mods::publish_window(w.window_json(window));
         w.reload_config(window, cx);
         install_layouts();
         let name = mods::shared("layout").and_then(|v| v.as_str().map(str::to_owned)).filter(|n| layout_path(n).exists());
@@ -5557,6 +5568,8 @@ export default class Probe extends View {
     }
 
     include!("window/pane_size_tests.rs");
+    include!("window/theme_api_tests.rs");
+    include!("window/theme_api_perf.rs");
 
     #[test]
     fn terminal_menu_preserves_clicked_target_and_uses_mod_dimensions() {

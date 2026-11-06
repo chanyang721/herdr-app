@@ -994,6 +994,9 @@ All of it is in `herdr.d.ts`. In short:
   `pickFolder({ prompt })`: the system's folder picker (here only),
   resolves with the folder or null.
 - Files: `readTextFile(path, { on })` (here, or on that machine),
+  `readJsonFile(path, { hash?, maxBytes? })` (local, native worker parsing and shared
+  metadata/content cache; status `ok`, `too_large`, `parse_error`, `read_error`;
+  same hash returns `changed: false, value: null`; default 8 MiB, max 64 MiB),
   `writeTextFile(path, text, expected)` (here only), and
   `watchFolder(dir)` (here only; poll a remote space's folder): resolves with the changed paths the next time anything
   under `dir` changes. On Linux, Git-ignored directories and Git objects are skipped,
@@ -1006,6 +1009,9 @@ All of it is in `herdr.d.ts`. In short:
 - This copy: `props()`, `shared(key)` / `setShared(key, value)` (every mod
   sees it; setting re-renders all), `nextCommand()` (key commands for this
   mod: `cx.spawn(async (cx) => { for (;;) { const c = await nextCommand(); …; cx.notify(); } })`).
+  The same receiver gets `"window.visibility"` even while hidden: reread
+  `window().visible` to stop/resume motion. This state is independent of focus;
+  full occlusion detection depends on the OS (Windows reports non-minimized visibility).
 
 Mods are trusted code: commands and network access (including `fetch`) are unrestricted.
 Other built-ins: `localStorage` (per mod copy), `console.log`, `fetch`,

@@ -43,6 +43,11 @@ on:
       - .github/workflows/release.yml
   # Builds only; publishing needs a tag.
   workflow_dispatch:
+    inputs:
+      theme_api_qa:
+        description: Build isolated Windows theme API binaries and timing diagnostics
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -60,6 +65,7 @@ env:
 
 jobs:
   build:
+    if: ${{ !(github.repository == 'chanyang721/herdr-app' && github.event_name == 'workflow_dispatch' && inputs.theme_api_qa) }}
     strategy:
       fail-fast: true
       matrix:
@@ -151,6 +157,116 @@ jobs:
         with:
           name: herdr-app-${{ matrix.target }}
           path: dist/herdr-app-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  # Task-branch QA on the personal fork only: no packaging, signing or publishing.
+  theme-api-windows:
+    if: github.repository == 'chanyang721/herdr-app' && github.event_name == 'workflow_dispatch' && inputs.theme_api_qa
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: "1"
+      CARGO_INCREMENTAL: "0"
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: release-v2-windows-x86_64-${{ env.RUST_TOOLCHAIN }}-zig${{ env.ZIG_VERSION }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: release-v2-windows-x86_64-${{ env.RUST_TOOLCHAIN }}-zig${{ env.ZIG_VERSION }}-${{ hashFiles('Cargo.lock') }}-
+      - name: Limit Zig build parallelism
+        run: |
+          $zigBinary = (Get-Command zig).Source
+          $wrapper = Join-Path $env:RUNNER_TEMP 'theme-api-zig.cmd'
+          @"
+          @echo off
+          if "%~1"=="build" (
+            "$zigBinary" %* -j1
+          ) else (
+            "$zigBinary" %*
+          )
+          "@ | Set-Content -LiteralPath $wrapper -Encoding ascii
+          "ZIG=$wrapper" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Build clean release application
+        run: |
+          cargo build --release --locked -j 1 --bin herdr-app
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          git diff --exit-code
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory theme-api-artifact -Force | Out-Null
+          Copy-Item target/release/herdr-app.exe theme-api-artifact/herdr-app.exe
+          Copy-Item LICENSE,THIRD-PARTY-NOTICES theme-api-artifact
+          $manifest = @{
+            source_sha = '${{ github.sha }}'
+            profile = 'release (optimized), Rust 1.95.0, Windows x86_64 MSVC'
+            exe_sha256 = (Get-FileHash theme-api-artifact/herdr-app.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+            clean_application = $true
+            installation = 'none; isolated HERDR_APP_HOME only'
+          }
+          $manifest | ConvertTo-Json | Set-Content theme-api-artifact/application.json -Encoding utf8
+      - name: Build diagnostic test executable with timing-only overlays
+        run: |
+          python scripts/theme-api-instrument.py --out-dir theme-api-artifact/instrumentation --apply
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $info = Join-Path $env:RUNNER_TEMP 'theme-api-tests.jsonl'
+          cargo test --release --locked -j 1 --bin herdr-app --no-run --message-format=json > $info
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $tests = @(Get-Content $info | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object {
+            $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'herdr-app' -and $_.profile.test -and $_.executable
+          })
+          if ($tests.Count -ne 1) { throw 'Expected one diagnostic test executable' }
+          Copy-Item -LiteralPath $tests[0].executable -Destination theme-api-artifact/herdr-app-bench.exe
+          Copy-Item tests/fixtures/json-feeds/*.json theme-api-artifact
+          @{
+            source_sha = '${{ github.sha }}'
+            profile = 'release test, timing overlays in instrumentation/manifest.json'
+            exe_sha256 = (Get-FileHash theme-api-artifact/herdr-app-bench.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          } | ConvertTo-Json | Set-Content theme-api-artifact/diagnostic.json -Encoding utf8
+      - name: Verify Promise owners and hidden visibility delivery
+        run: |
+          & ./theme-api-artifact/herdr-app-bench.exe json_file_promises_preserve_each_mod_copys_owner --nocapture --test-threads=1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & ./theme-api-artifact/herdr-app-bench.exe mods_see_native_visibility_without_waiting_for_focus_poll --nocapture --test-threads=1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Measure exact public feeds and large payload
+        run: |
+          $env:HERDR_TEST_WINDOW = 'theme_api_performance'
+          $env:HERDR_JSON_BENCH = '1'
+          foreach ($name in @('panel-feed-demo-sanitized.json', 'panel-feed-20x60-sanitized.json', 'large')) {
+            $env:HERDR_APP_HOME = Join-Path $env:RUNNER_TEMP "theme-api-$name"
+            if ($name -eq 'large') {
+              Remove-Item Env:HERDR_JSON_PERF_FIXTURE -ErrorAction SilentlyContinue
+              $env:HERDR_JSON_PERF_BYTES = '2621440'
+            } else {
+              $env:HERDR_JSON_PERF_FIXTURE = (Resolve-Path "theme-api-artifact/$name").Path
+            }
+            & ./theme-api-artifact/herdr-app-bench.exe --exact window::tests::theme_api_performance --nocapture --test-threads=1 2>&1 |
+              Tee-Object -FilePath "theme-api-artifact/timing-$name.log"
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: theme-api-windows-release-${{ github.sha }}
+          path: theme-api-artifact
           if-no-files-found: error
           retention-days: 7
 
