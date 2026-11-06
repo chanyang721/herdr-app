@@ -6337,7 +6337,8 @@ export default class Header extends View {
             hold(cx, automatic);
             for person in [true, false] {
                 let reply = pane_move(cx, person);
-                assert!(reply["error"].as_str().is_some_and(|e| e.contains("held")), "automatic {automatic} person {person}: {reply}");
+                let held = if automatic { "automatic close pending; selection is held" } else { "guarded close pending; structural changes are held" };
+                assert_eq!(reply["error"], held, "automatic {automatic} person {person}");
                 assert_eq!(state(cx), before, "automatic {automatic} person {person}");
             }
             // A drag can't start while the close is pending.
