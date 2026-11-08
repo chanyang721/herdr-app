@@ -6,7 +6,8 @@ name: ci
 
 on:
   push:
-    branches: [master]
+    # Fork-only: run the suite for this fix branch without opening a PR.
+    branches: [master, ci/reload-oom-fresh-vm]
   # No paths-ignore here: CI is required to merge, so every PR needs it.
   pull_request:
 
@@ -41,7 +42,8 @@ jobs:
           - { platform: macos-aarch64, runner: macos-15 }
           - { platform: windows-x86_64, runner: windows-2022 }
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    # Fork-only: no build cache here, so the first build starts cold.
+    timeout-minutes: 90
     defaults:
       run:
         shell: bash
