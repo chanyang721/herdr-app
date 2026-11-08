@@ -7,7 +7,7 @@ name: ci
 on:
   push:
     # Fork-only: run the suite for this fix branch without opening a PR.
-    branches: [master, ci/reload-oom-fresh-vm]
+    branches: [master, 'ci/reload-oom-*']
   # No paths-ignore here: CI is required to merge, so every PR needs it.
   pull_request:
 
